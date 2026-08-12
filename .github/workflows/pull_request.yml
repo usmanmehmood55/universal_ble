@@ -5,6 +5,21 @@ on:
     branches: [main]
 
 jobs:
+  windows-native-test:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure Windows native tests
+        run: cmake -S windows/test -B build/windows-native-tests
+
+      - name: Build Windows native tests
+        run: cmake --build build/windows-native-tests --config Release
+
+      - name: Run Windows native tests
+        run: ctest --test-dir build/windows-native-tests -C Release --output-on-failure
+
   test:
     runs-on: ubuntu-latest
 
