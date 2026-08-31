@@ -14,8 +14,10 @@ class UniversalBleAsyncServiceDiscovery: NSObject {
     private let deviceId: String
     private let completion: (Result<[UniversalBleService], Error>) -> Void
     private var discoveredServicesProgressMap: [UniversalBleService] = []
-    private var discoveredDescriptorsSet: Set<String> = []
-    private var expectedCharacteristicsCountMap: [String: Int] = [:]
+    // GATT UUIDs identify attribute types, not individual CoreBluetooth objects.
+    private var serviceIndexMap: [ObjectIdentifier: Int] = [:]
+    private var discoveredDescriptorsSet: Set<ObjectIdentifier> = []
+    private var expectedCharacteristicsCountMap: [ObjectIdentifier: Int] = [:]
     private var isDiscoveryInProgress = false
     private var hasCompleted = false
     private var withDescriptors: Bool
@@ -79,6 +81,7 @@ class UniversalBleAsyncServiceDiscovery: NSObject {
         timeoutWorkItem?.cancel()
         timeoutWorkItem = nil
         discoveredServicesProgressMap.removeAll()
+        serviceIndexMap.removeAll()
         discoveredDescriptorsSet.removeAll()
         expectedCharacteristicsCountMap.removeAll()
     }
@@ -92,7 +95,11 @@ class UniversalBleAsyncServiceDiscovery: NSObject {
 
     private func handleServicesDiscovered(_ services: [CBService]) {
         discoveredServicesProgressMap = services.map { UniversalBleService(uuid: $0.uuid.uuidString, characteristics: nil) }
-        discoveredDescriptorsSet = Set<String>()
+        serviceIndexMap.removeAll(keepingCapacity: true)
+        for (index, service) in services.enumerated() {
+            serviceIndexMap[ObjectIdentifier(service)] = index
+        }
+        discoveredDescriptorsSet = Set<ObjectIdentifier>()
         expectedCharacteristicsCountMap = [:]
 
         // If no services, complete discovery immediately
@@ -114,11 +121,12 @@ class UniversalBleAsyncServiceDiscovery: NSObject {
     }
 
     private func processCharacteristicsForService(_ service: CBService) {
+        let serviceKey = ObjectIdentifier(service)
         let serviceUuid = service.uuid.uuidString
         guard let characteristics = service.characteristics else {
             // Service has no characteristics, mark as complete
-            expectedCharacteristicsCountMap[serviceUuid] = 0
-            if let index = discoveredServicesProgressMap.firstIndex(where: { $0.uuid == serviceUuid }) {
+            expectedCharacteristicsCountMap[serviceKey] = 0
+            if let index = serviceIndexMap[serviceKey] {
                 discoveredServicesProgressMap[index] = UniversalBleService(uuid: serviceUuid, characteristics: [])
             }
             checkForDiscoveryCompletion()
@@ -126,11 +134,11 @@ class UniversalBleAsyncServiceDiscovery: NSObject {
         }
 
         // Store expected characteristic count for this service
-        expectedCharacteristicsCountMap[serviceUuid] = characteristics.count
+        expectedCharacteristicsCountMap[serviceKey] = characteristics.count
 
         // If no characteristics, mark service as complete
         if characteristics.isEmpty {
-            if let index = discoveredServicesProgressMap.firstIndex(where: { $0.uuid == serviceUuid }) {
+            if let index = serviceIndexMap[serviceKey] {
                 discoveredServicesProgressMap[index] = UniversalBleService(uuid: serviceUuid, characteristics: [])
             }
             checkForDiscoveryCompletion()
@@ -146,7 +154,7 @@ class UniversalBleAsyncServiceDiscovery: NSObject {
                 }
             }
         } else {
-            if let index = discoveredServicesProgressMap.firstIndex(where: { $0.uuid == serviceUuid }) {
+            if let index = serviceIndexMap[serviceKey] {
                 discoveredServicesProgressMap[index] = UniversalBleService(
                     uuid: serviceUuid,
                     characteristics: characteristics.map {
@@ -168,14 +176,14 @@ class UniversalBleAsyncServiceDiscovery: NSObject {
         }
 
         let serviceUuid = service.uuid.uuidString
-        let characteristicUuid = characteristic.uuid.uuidString
-        let characteristicKey = "\(serviceUuid):\(characteristicUuid)"
+        let serviceKey = ObjectIdentifier(service)
+        let characteristicKey = ObjectIdentifier(characteristic)
 
         // Mark this characteristic's descriptors as discovered
         discoveredDescriptorsSet.insert(characteristicKey)
 
         // Get expected characteristic count for this service
-        guard let expectedCount = expectedCharacteristicsCountMap[serviceUuid] else {
+        guard let expectedCount = expectedCharacteristicsCountMap[serviceKey] else {
             return
         }
 
@@ -185,8 +193,7 @@ class UniversalBleAsyncServiceDiscovery: NSObject {
         }
 
         let discoveredCount = allCharacteristics.filter { char in
-            let key = "\(serviceUuid):\(char.uuid.uuidString)"
-            return discoveredDescriptorsSet.contains(key)
+            discoveredDescriptorsSet.contains(ObjectIdentifier(char))
         }.count
 
         // Only update the service when all characteristics have descriptors discovered
@@ -202,7 +209,7 @@ class UniversalBleAsyncServiceDiscovery: NSObject {
                 )
             }
 
-            if let index = discoveredServicesProgressMap.firstIndex(where: { $0.uuid == serviceUuid }) {
+            if let index = serviceIndexMap[serviceKey] {
                 discoveredServicesProgressMap[index] = UniversalBleService(uuid: serviceUuid, characteristics: universalBleCharacteristicsList)
             }
 
