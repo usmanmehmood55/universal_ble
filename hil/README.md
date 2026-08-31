@@ -48,9 +48,10 @@ active connection and CCC state alone.
 
 ## 3. Execution boundary
 
-The automated suite currently runs on Windows. Calls start at the public Dart
-API and go through Pigeon, the Windows C++ plugin, WinRT, the Bluetooth stack,
-the radio link, and finally the Zephyr GATT server.
+The broad automated suite currently runs on Windows. The duplicate-UUID tests
+run on iOS or macOS because they specifically exercise CoreBluetooth object
+identity. Calls start at the public Dart API and cross the complete native BLE
+stack, radio link, and Zephyr GATT server.
 
 Fixture control also uses BLE, so faults are armed while the device is
 connected. The firmware then runs them locally using valid GATT behavior.
@@ -61,7 +62,7 @@ The platform runners are generated locally and are not stored in Git. Create
 them after cloning or when testing a new platform:
 
 ```powershell
-flutter create --platforms=android,web,windows .
+flutter create --platforms=android,ios,macos,web,windows .
 ```
 
 For Android, add these permissions directly below the opening `<manifest>`
@@ -83,6 +84,16 @@ advertising. From this directory, run:
 flutter pub get
 flutter test integration_test/baseline_hil_test.dart -d windows
 flutter test integration_test/fault_injection_hil_test.dart -d windows
+```
+
+Run the duplicate-UUID coverage on an Apple target with the matching revision
+2 fixture firmware flashed:
+
+```sh
+flutter test integration_test/baseline_hil_test.dart -d macos \
+  --plain-name 'discovers duplicate service and characteristic UUID instances'
+flutter test integration_test/fault_injection_hil_test.dart -d macos \
+  --plain-name 'FIT-DISC-015'
 ```
 
 If you already know the Windows device ID, you can skip the initial scan:
