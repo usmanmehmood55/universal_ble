@@ -171,6 +171,64 @@ void main() {
       expect(_characteristic(service, HilUuid.read).descriptors, isNotEmpty);
     });
 
+    testWidgets(
+      'discovers duplicate service and characteristic UUID instances',
+      (_) async {
+        await peripheral.setDuplicateUuidService(enabled: true);
+        try {
+          late List<BleService> withoutDescriptors;
+          await _eventually(() async {
+            withoutDescriptors = await peripheral.discover(
+              withDescriptors: false,
+            );
+            return _duplicateUuidServices(withoutDescriptors).length == 2;
+          });
+          final servicesWithoutDescriptors = _duplicateUuidServices(
+            withoutDescriptors,
+          );
+          expect(
+            servicesWithoutDescriptors.map(
+              (service) => service.characteristics.length,
+            ),
+            unorderedEquals([10, 2]),
+          );
+          expect(
+            servicesWithoutDescriptors
+                .expand((service) => service.characteristics)
+                .expand((characteristic) => characteristic.descriptors),
+            isEmpty,
+          );
+
+          final withDescriptors = await peripheral.discover();
+          final duplicateService = _duplicateUuidServices(
+            withDescriptors,
+          ).singleWhere((service) => service.characteristics.length == 2);
+          expect(
+            duplicateService.characteristics.map(
+              (characteristic) => characteristic.uuid,
+            ),
+            everyElement(
+              predicate<String>(
+                (uuid) => BleUuidParser.compareStrings(uuid, HilUuid.read),
+              ),
+            ),
+          );
+          for (final characteristic in duplicateService.characteristics) {
+            expect(
+              characteristic.descriptors.map(
+                (descriptor) => descriptor.uuid,
+              ),
+              contains(BleUuidParser.string('2901')),
+            );
+          }
+        } finally {
+          await peripheral.setDuplicateUuidService(enabled: false);
+        }
+      },
+      skip: defaultTargetPlatform != TargetPlatform.iOS &&
+          defaultTargetPlatform != TargetPlatform.macOS,
+    );
+
     testWidgets('reads the deterministic default and a configured value', (
       _,
     ) async {
@@ -585,6 +643,9 @@ void main() {
 
 bool _isHilService(String uuid) =>
     BleUuidParser.compareStrings(uuid, HilUuid.service);
+
+List<BleService> _duplicateUuidServices(Iterable<BleService> services) =>
+    services.where((service) => _isHilService(service.uuid)).toList();
 
 BleCharacteristic _characteristic(BleService service, String uuid) =>
     service.characteristics.singleWhere(

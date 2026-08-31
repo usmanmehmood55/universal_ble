@@ -57,6 +57,7 @@
 * Android: instantly close the GATT client on disconnect
 * Android: complete only the oldest matching pending write on onCharacteristicWrite
 * iOS/macOS: Handle service discovery failure and timeout to prevent poisoning subsequent `discoverServices` calls
+* iOS/macOS: Discover duplicate service and characteristic UUID instances without merging their state
 
 ## 2.1.1
 * Handle device IDs case-insensitively
