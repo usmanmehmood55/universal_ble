@@ -2,6 +2,7 @@
 * **Breaking:** Add `QueueType.auto` which auto-selects the best queueing strategy per platform: Android uses a per-device queue, all other platforms run commands in parallel. It is now the default for both `UniversalBle` and `UniversalBlePeripheral`, replacing the previous `QueueType.global` default.
 * iOS/macOS: Handle write-without-response transmit buffer backpressure
 * iOS/macOS: complete concurrent reads, descriptor operations, notification changes, and RSSI reads one callback at a time.
+* Web: wait for advertisement watching to stop before starting a GATT connection.
 
 ## 2.3.0
 * Windows: support connectionless manufacturer-data advertising without a GATT service, including state/error reporting and cleanup on stop/disposal.
