@@ -45,6 +45,7 @@ abstract final class HilCommand {
   static const notifyPressure = 0x14;
   static const armConnectFault = 0x15;
   static const armDiscoveryFault = 0x16;
+  static const setDuplicateUuidService = 0x17;
 }
 
 final class HilTelemetry {
@@ -141,7 +142,9 @@ final class HilPeripheral {
 
   String get deviceId => device.deviceId;
 
-  static Future<HilPeripheral> open() async {
+  static Future<HilPeripheral> open({
+    int expectedContractRevision = contractRevision,
+  }) async {
     UniversalBle.timeout = operationTimeout;
     UniversalBle.queueType = QueueType.global;
     await UniversalBle.setLogLevel(BleLogLevel.verbose);
@@ -155,9 +158,10 @@ final class HilPeripheral {
     await peripheral.reset();
     final actualContractRevision =
         (await peripheral.readState()).contractRevision;
-    if (actualContractRevision != contractRevision) {
+    if (actualContractRevision != expectedContractRevision) {
+      await peripheral.close();
       throw StateError(
-        'HIL fixture contract mismatch: expected revision $contractRevision, '
+        'HIL fixture contract mismatch: expected revision $expectedContractRevision, '
         'received $actualContractRevision. Build and flash the matching '
         'universal_ble_hil_firmware image.',
       );
@@ -348,6 +352,10 @@ final class HilPeripheral {
 
   Future<void> armNotificationOnSubscribe() =>
       command(HilCommand.notifyOnSubscribe);
+
+  // Available only on the revision 3 duplicate-UUID fixture image.
+  Future<void> setDuplicateUuidService({required bool enabled}) =>
+      command(HilCommand.setDuplicateUuidService, [enabled ? 1 : 0]);
 
   Future<void> setAuxiliaryService({required bool enabled}) =>
       command(HilCommand.setAuxiliaryService, [enabled ? 1 : 0]);

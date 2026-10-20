@@ -143,3 +143,35 @@ flutter test integration_test/fault_injection_hil_test.dart -d windows `
 The log records the seed, operation, callback delay and disconnect offset for
 each step. Keep the same Dart SDK when replaying a sequence: `Random` does not
 promise identical sequences across SDK versions.
+
+## Apple duplicate UUID discovery
+
+`integration_test/duplicate_uuid_hil_test.dart` contains three Apple-only tests:
+
+duplicate discovery with and without descriptors (each repeated against the
+CoreBluetooth cache), and `FIT-DISC-015`, which adds and removes the duplicate
+profile three times and verifies ordinary reads still work after removal.
+Both service instances must retain their own characteristic lists (10 and 2
+entries). Each of the two equal-UUID characteristics must retain its own 2901
+descriptor when descriptors are requested.
+
+These tests use the dedicated **revision 3 duplicate-UUID fixture image**, from
+branch `codex/add-duplicate-uuid-hil-profile` of `universal_ble_hil_firmware`
+(commit `bd4e6a5` or a compatible successor).
+Its enable/disable command is `0x17` with one byte (`0` or `1`). The previous
+experimental image used `0x10`, which conflicts with the broad revision 2
+suite's indication command. The new suite checks revision 3 explicitly;
+revision 3 is not a replacement image for the broad revision 2 suite.
+
+Generate an Apple runner if needed, configure Bluetooth permissions as for the
+example application, then run from `hil/` with the fixture flashed and nearby:
+
+```sh
+flutter create --platforms=ios,macos .
+flutter test integration_test/duplicate_uuid_hil_test.dart -d macos
+```
+
+Use an iOS device ID instead of `macos` to run on a physical iPhone. Tests
+restore the original GATT profile in teardown, including after assertion
+failures. They do not address individual duplicate instances for reads/writes;
+the assertions inspect discovery results only while the profile is enabled.
