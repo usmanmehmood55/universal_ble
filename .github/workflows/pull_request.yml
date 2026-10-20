@@ -5,6 +5,13 @@ on:
     branches: [main]
 
 jobs:
+  darwin-discovery:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test Apple service discovery bookkeeping
+        run: python3 darwin/test/run_service_discovery_tests.py
+
   windows:
     runs-on: windows-latest
     steps:

@@ -17,10 +17,6 @@ and finally the Zephyr GATT server on the fixture.
   properties, and descriptor discovery enabled and disabled.
 - This catches problems in advertisement parsing, UUID conversion, WinRT
   discovery, and Dart model mapping.
-- On iOS and macOS, an additional test enables a legal GATT profile containing
-  duplicate service and characteristic UUID instances. It verifies discovery
-  both with and without descriptors and catches UUID-keyed CoreBluetooth
-  bookkeeping that merges separate objects or waits until timeout.
 
 ### 1.2. Reads and writes (5 tests)
 
@@ -105,7 +101,6 @@ the original write error is rethrown.
 | `FIT-DISC-009` | Changes the service database while a delayed read is pending      | Closing a service object still owned by an active read  |
 | `FIT-DISC-010` | Changes the service database while a delayed write is pending     | Closing a service object still owned by an active write |
 | `FIT-DISC-011` | Changes the service database while a delayed CCC write is pending | Stale refresh installation and lost subscriptions       |
-| `FIT-DISC-015` | Adds and removes duplicate service and characteristic UUID instances for three discovery cycles | Merged CoreBluetooth objects, premature descriptor completion, poisoned rediscovery state |
 
 ### 2.5. Descriptors
 

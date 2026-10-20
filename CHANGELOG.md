@@ -1,4 +1,5 @@
 ## 3.1.1
+* iOS/macOS: Discover duplicate service and characteristic UUID instances without merging their state
 * Apple, Linux: `discoverServices` honours its `timeout`. Both gave up after a fixed 10 seconds, so a longer `timeout` could not help a peripheral that is slow to answer. On Apple, `timeout` (or, without one, the global `UniversalBle.timeout`) is now passed on as the native limit, which `AppleDiscoverServicesOptions(timeoutMillis:)` in `DiscoverServicesPlatformConfig.apple` also sets directly, and then bounds the whole call when no `timeout` is given; without either, it stays 10 seconds. On Linux the discovery no longer has a limit of its own and is bounded by `timeout` alone, as on Android, Windows and Web, so one that runs out of time now fails with a `TimeoutException` rather than `Failed to resolve services` (#349).
 * Apple: a read, write or subscription the peripheral refuses now reports its ATT error as the matching `UniversalBleErrorCode` (`insufficientEncryption`, `insufficientAuthentication`, `readNotPermitted`, ...), as Android does, instead of `unknownError`. The error code is still in `details`. Codes in `CBErrorDomain` are unchanged: its numbers overlap ATT's with other meanings (#348).
 * Windows: a read, write or subscription the peripheral refuses now reports its ATT error as the matching `UniversalBleErrorCode` (`insufficientEncryption`, `insufficientAuthentication`, `readNotPermitted`, ...) instead of the generic `failed`, as Android already does. Characteristic/descriptor reads and writes and `SetNotifiable` are covered; service/characteristic discovery at connect time is unchanged. Application-defined codes `0x80`-`0xFF` now report `unknownError`. The raw ATT error code is still in `details`.
@@ -77,7 +78,6 @@
 * Android: instantly close the GATT client on disconnect
 * Android: complete only the oldest matching pending write on onCharacteristicWrite
 * iOS/macOS: Handle service discovery failure and timeout to prevent poisoning subsequent `discoverServices` calls
-* iOS/macOS: Discover duplicate service and characteristic UUID instances without merging their state
 
 ## 2.1.1
 * Handle device IDs case-insensitively

@@ -534,47 +534,6 @@ void main() {
       _pending(
         '[FIT-DISC-014] ignores discovery completion from a superseded connection',
       );
-      testWidgets(
-        '[FIT-DISC-015] preserves duplicate UUID instances across GATT profile changes',
-        (_) async {
-          for (var cycle = 0; cycle < 3; cycle++) {
-            await peripheral.setDuplicateUuidService(enabled: true);
-            await _waitUntil(
-              () async =>
-                  _duplicateUuidServices(await peripheral.discover()).length ==
-                  2,
-            );
-            final duplicateService = _duplicateUuidServices(
-              await peripheral.discover(),
-            ).singleWhere((service) => service.characteristics.length == 2);
-            expect(duplicateService.characteristics, hasLength(2));
-            expect(
-              duplicateService.characteristics.map(
-                (characteristic) => characteristic.descriptors.length,
-              ),
-              everyElement(greaterThanOrEqualTo(1)),
-            );
-
-            await peripheral.setDuplicateUuidService(enabled: false);
-            await _waitUntil(
-              () async =>
-                  _duplicateUuidServices(
-                    await peripheral.discover(withDescriptors: false),
-                  ).length ==
-                  1,
-            );
-          }
-
-          expect(
-            utf8.decode(await peripheral.read(HilUuid.read)),
-            'HIL-READ-V1',
-          );
-        },
-        timeout: const Timeout(Duration(minutes: 2)),
-        skip:
-            defaultTargetPlatform != TargetPlatform.iOS &&
-            defaultTargetPlatform != TargetPlatform.macOS,
-      );
     });
 
     group('read faults', () {
@@ -1709,14 +1668,6 @@ Future<bool> _hasService(HilPeripheral peripheral, String serviceUuid) async {
     (service) => BleUuidParser.compareStrings(service.uuid, serviceUuid),
   );
 }
-
-List<BleService> _duplicateUuidServices(Iterable<BleService> services) =>
-    services
-        .where(
-          (service) =>
-              BleUuidParser.compareStrings(service.uuid, HilUuid.service),
-        )
-        .toList();
 
 Future<void> _requestImmediateDisconnect(HilPeripheral peripheral) async {
   await _requestDisconnectAndWait(peripheral, Duration.zero);
