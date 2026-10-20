@@ -197,3 +197,15 @@ That MTA cleanup drain does not pump application messages during teardown.
 The full FIT catalog also contains 58 pending scenarios. Together with the 11
 explicit limitations above, these account for 69 skips; none are counted among
 the 60 implemented FIT cases.
+
+## Apple duplicate UUID discovery (hardware execution pending)
+
+The dedicated `duplicate_uuid_hil_test.dart` suite requires the revision 3
+fixture described in `README.md`. These three tests are additional to the
+Windows coverage counts above:
+
+| Test | Assertions | Regression |
+| --- | --- | --- |
+| Duplicate UUIDs, descriptors disabled | Two equal-UUID services keep 10 and 2 characteristics, repeated discovery returns no descriptors | UUID-keyed service slots overwrite one another and time out |
+| Duplicate UUIDs, descriptors enabled | Both equal-UUID characteristics have their own 2901 descriptors on fresh and cached discovery | Descriptor completion shared across equal UUIDs returns incomplete data |
+| `FIT-DISC-015` | Three add/remove cycles preserve both instances, restore the original table, and allow an ordinary read | Discovery state remains incomplete or merges instances across Service Changed events |
