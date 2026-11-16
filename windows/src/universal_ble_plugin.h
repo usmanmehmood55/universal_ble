@@ -47,6 +47,15 @@ struct GattDiscovery {
   std::optional<std::string> error;
 };
 
+// Everything one connection owns that has to be closed off the UI thread.
+struct ClosingConnection {
+  BluetoothLEDevice device{nullptr};
+  GattSession session{nullptr};
+  std::unordered_map<std::string, GattServiceObject> gatt_map;
+  std::optional<event_token> connection_status_changed_token;
+  std::optional<event_token> gatt_services_changed_token;
+};
+
 struct GattSubscriptionSnapshot {
   uint64_t revision = 0;
   std::vector<std::pair<std::string, std::string>> characteristics;
@@ -90,6 +99,9 @@ struct BluetoothDeviceAgent {
   // the disposal coroutine by the caller that wins Deactivate().
   AsyncOperationTracker::Lease cleanup_reservation;
   BluetoothLEDevice device;
+  // Set only for an autoConnect connection, where it keeps the link wanted.
+  GattSession session{nullptr};
+  bool auto_connect = false;
   event_token connection_status_changed_token;
   event_token gatt_services_changed_token;
   std::unordered_map<std::string, GattServiceObject> gatt_map;
@@ -438,8 +450,11 @@ private:
       std::function<void(UniversalBleCallbackChannel *)> &&report);
   void PostPeripheralReport(
       std::function<void(UniversalBlePeripheralCallback *)> &&report);
-  fire_and_forget ConnectAsync(uint64_t bluetooth_address,
+  void StartConnect(uint64_t bluetooth_address, bool auto_connect);
+  bool IsCurrentConnectAttempt(uint64_t bluetooth_address,
                                uint64_t connect_generation);
+  fire_and_forget ConnectAsync(uint64_t bluetooth_address,
+                               uint64_t connect_generation, bool auto_connect);
   static IAsyncAction DiscoverCharacteristicsAsync(
       IVectorView<GattDeviceService> services, BluetoothCacheMode cache_mode,
       std::shared_ptr<GattDiscovery> out);
@@ -520,28 +535,15 @@ private:
   // Requires connected_devices_mutex_. Does not deactivate or close objects.
   void ReserveConnectionCleanupLocked(
       const std::shared_ptr<BluetoothDeviceAgent> &device_agent);
-  static fire_and_forget DisposeConnectionAsync(
-      std::shared_ptr<BluetoothDeviceAgent> device_agent,
-      AsyncOperationTracker::Lease cleanup_lease,
-      AsyncOperationTracker::Lease connection_cleanup_lease);
   // Disposes a connection attempt that never became a BluetoothDeviceAgent.
-  // Like DisposeConnection, closes the WinRT objects off Flutter's UI thread
-  // and holds the address's cleanup reservation until Close returns.
-  void DisposePartialConnection(
-      uint64_t bluetooth_address, BluetoothLEDevice device,
-      std::unordered_map<std::string, GattServiceObject> gatt_map,
-      std::optional<event_token> connection_status_changed_token,
-      std::optional<event_token> gatt_services_changed_token);
-  static fire_and_forget DisposePartialConnectionAsync(
-      BluetoothLEDevice device,
-      std::unordered_map<std::string, GattServiceObject> gatt_map,
-      std::optional<event_token> connection_status_changed_token,
-      std::optional<event_token> gatt_services_changed_token,
-      AsyncOperationTracker::Lease cleanup_lease,
+  void DisposePartialConnection(uint64_t bluetooth_address,
+                                ClosingConnection closing);
+  void CloseConnection(uint64_t bluetooth_address, ClosingConnection closing,
+                       AsyncOperationTracker::Lease reservation);
+  static fire_and_forget CloseConnectionAsync(
+      ClosingConnection closing, AsyncOperationTracker::Lease cleanup_lease,
       AsyncOperationTracker::Lease connection_cleanup_lease);
   void ResetState();
-  static void DisposeServices(
-      const std::shared_ptr<BluetoothDeviceAgent> &device_agent);
   static void DisposeGattMap(
       std::unordered_map<std::string, GattServiceObject> gatt_map,
       const std::vector<GattDeviceService> *retained_services = nullptr);

@@ -70,4 +70,25 @@ private:
   std::shared_ptr<State> state_;
 };
 
+// A lease for a coroutine that should keep its owner alive while it runs but
+// not while it is suspended. Release before an await, Acquire after it; a
+// failed Acquire means the owner has closed the tracker and may be gone.
+class ScopedLease {
+public:
+  explicit ScopedLease(const AsyncOperationTracker &tracker)
+      : tracker_(tracker) {}
+
+  bool Acquire() {
+    lease_ = tracker_.TryAcquire();
+    return lease_.has_value();
+  }
+  void Release() { lease_.reset(); }
+  bool Held() const { return lease_.has_value(); }
+
+private:
+  // A copy shares the tracker's state, so it stays valid after the owner.
+  AsyncOperationTracker tracker_;
+  std::optional<AsyncOperationTracker::Lease> lease_;
+};
+
 }  // namespace universal_ble

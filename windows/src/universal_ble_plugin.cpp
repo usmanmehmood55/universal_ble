@@ -63,6 +63,37 @@ void safe_reply(const char *context, const Reply &reply,
   }
 }
 
+// Runs one cleanup step and logs its failure, so the steps after it still run.
+template <typename Step>
+void Attempt(const char *what, Step &&step) noexcept {
+  try {
+    try {
+      step();
+    } catch (const hresult_error &err) {
+      UniversalBleLogger::LogError(
+          std::string(what) + " hresult_error hr=" +
+          std::to_string(err.code()) + " msg=" + to_string(err.message()));
+    } catch (const std::exception &ex) {
+      log_and_swallow(what, ex);
+    } catch (...) {
+      log_and_swallow_unknown(what);
+    }
+  } catch (...) {
+    // Logging itself failed; there is nothing left to report with.
+  }
+}
+
+// Pins this DLL for the life of the process. A worker that outlives the plugin
+// keeps running plugin code, which a host that unloads the DLL would unmap.
+bool KeepModuleLoaded() noexcept {
+  static const wchar_t module_anchor = L'\0';
+  HMODULE module = nullptr;
+  // Avoid stream output here: a blocked log sink could stall shutdown again.
+  return GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                GET_MODULE_HANDLE_EX_FLAG_PIN,
+                            &module_anchor, &module) != FALSE;
+}
+
 std::string to_lower_case(std::string value) {
   std::transform(
       value.begin(), value.end(), value.begin(),
@@ -185,14 +216,8 @@ UniversalBlePlugin::~UniversalBlePlugin() {
   // Keep disposal failure logs to diagnose handler removal and Close()
   // failures. If the DLL is pinned at the deadline, those logs may reach
   // stdout after engine teardown.
-  DrainConnectionCleanup(cleanup_operations_, std::chrono::seconds(3), [] {
-    static const wchar_t module_anchor = L'\0';
-    HMODULE module = nullptr;
-    // Avoid stream output here: a blocked log sink could stall shutdown again.
-    return GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                                  GET_MODULE_HANDLE_EX_FLAG_PIN,
-                              &module_anchor, &module) != FALSE;
-  });
+  DrainConnectionCleanup(cleanup_operations_, std::chrono::seconds(3),
+                         KeepModuleLoaded);
   ui_thread_handler_.Shutdown();
   callback_channel_.reset();
   peripheral_callback_channel_.reset();
@@ -467,9 +492,14 @@ std::optional<FlutterError> UniversalBlePlugin::SetLogLevel(
 std::optional<FlutterError> UniversalBlePlugin::Connect(
     const std::string &device_id, const bool *auto_connect,
     const ConnectionPlatformConfig *platform_config) {
-  // Note: autoConnect is not directly supported on Windows platform
   // Note: platformConfig carries platform-specific options
-  const auto bluetooth_address = str_to_mac_address(device_id);
+  StartConnect(str_to_mac_address(device_id),
+               auto_connect != nullptr && *auto_connect);
+  return std::nullopt;
+}
+
+void UniversalBlePlugin::StartConnect(const uint64_t bluetooth_address,
+                                      const bool auto_connect) {
   std::shared_ptr<BluetoothDeviceAgent> stale_device;
   std::optional<uint64_t> connect_generation;
   {
@@ -494,7 +524,7 @@ std::optional<FlutterError> UniversalBlePlugin::Connect(
         NotifyConnectionChanged(
             bluetooth_address, true, std::nullopt,
             generation == connect_generations_.end() ? 0 : generation->second);
-        return std::nullopt;
+        return;
       }
 
       stale_device = existing->second;
@@ -512,10 +542,9 @@ std::optional<FlutterError> UniversalBlePlugin::Connect(
 
   DisposeConnection(stale_device);
   if (connect_generation.has_value()) {
-    ConnectAsync(bluetooth_address, connect_generation.value());
+    ConnectAsync(bluetooth_address, connect_generation.value(), auto_connect);
   }
-  return std::nullopt;
-};
+}
 
 std::optional<FlutterError> UniversalBlePlugin::Disconnect(
     const std::string &device_id) {
@@ -1797,31 +1826,34 @@ void UniversalBlePlugin::NotifyConnectionException(
   }
 }
 
+bool UniversalBlePlugin::IsCurrentConnectAttempt(
+    const uint64_t bluetooth_address, const uint64_t connect_generation) {
+  std::lock_guard<std::mutex> lock(connected_devices_mutex_);
+  const auto generation = connect_generations_.find(bluetooth_address);
+  return generation != connect_generations_.end() &&
+         generation->second == connect_generation;
+}
+
+// The plugin lease is held only while this coroutine runs, never while it is
+// suspended. Windows can take seconds to give up on an unreachable device and
+// a connection attempt cannot be cancelled, so a lease held across those
+// awaits would stall app shutdown for as long. After every await the lease is
+// retaken; when that fails the plugin is shutting down or gone, and the
+// attempt is abandoned without touching `this`.
 fire_and_forget UniversalBlePlugin::ConnectAsync(uint64_t bluetooth_address,
-                                                 uint64_t connect_generation) {
-  const auto callback = callback_operations_.TryAcquire();
-  if (!callback.has_value())
+                                                 uint64_t connect_generation,
+                                                 bool auto_connect) {
+  ScopedLease plugin(callback_operations_);
+  if (!plugin.Acquire())
     co_return;
-  BluetoothLEDevice device{nullptr};
-  std::unordered_map<std::string, GattServiceObject> gatt_map;
-  std::optional<event_token> connection_status_changed_token;
-  std::optional<event_token> gatt_services_changed_token;
+  ClosingConnection partial;
+  auto &device = partial.device;
   std::shared_ptr<BluetoothDeviceAgent> device_agent;
-  const auto dispose_partial_connection = [&]() noexcept {
-    try {
-      if (device_agent) {
-        CleanConnection(bluetooth_address, &device);
-        DisposeConnection(device_agent);
-        return;
-      }
-      DisposePartialConnection(bluetooth_address, std::move(device),
-                               std::move(gatt_map),
-                               connection_status_changed_token,
-                               gatt_services_changed_token);
-    } catch (...) {
-      log_and_swallow_unknown("ConnectAsync partial cleanup");
-    }
+  const auto abandon = [&]() noexcept {
+    KeepModuleLoaded();
+    CloseConnectionAsync(std::move(partial), nullptr, nullptr);
   };
+  std::optional<std::string> failure;
   try {
     // Old services can deny replacement discovery until Close finishes. Yield
     // rather than block Flutter's UI thread, and abandon superseded attempts.
@@ -1852,18 +1884,62 @@ fire_and_forget UniversalBlePlugin::ConnectAsync(uint64_t bluetooth_address,
             "Previous connection to the device is still closing");
         co_return;
       }
+      plugin.Release();
       co_await winrt::resume_after(std::chrono::milliseconds(10));
+      if (!plugin.Acquire())
+        co_return;
     }
+    plugin.Release();
     device = co_await BluetoothLEDevice::FromBluetoothAddressAsync(
         bluetooth_address);
+    if (!plugin.Acquire()) {
+      abandon();
+      co_return;
+    }
     if (!device) {
-      NotifyConnectFailureIfCurrent(bluetooth_address, connect_generation,
-                                    "Failed to get device");
+      NotifyConnectFailureIfCurrent(
+          bluetooth_address, connect_generation,
+          "Failed to get device. Windows only knows a device that is paired "
+          "or was seen in a recent scan");
       co_return;
     }
     UniversalBleLogger::LogInfo("ConnectionLog: Device found");
+
+    if (auto_connect) {
+      // MaintainConnection asks Windows to connect whenever the device is in
+      // range and to keep waiting until it is. There is no completion to
+      // await, so poll the link state until the device shows up or the
+      // attempt is superseded by disconnect() or a newer connect().
+      plugin.Release();
+      partial.session =
+          co_await GattSession::FromDeviceIdAsync(device.BluetoothDeviceId());
+      if (!plugin.Acquire()) {
+        abandon();
+        co_return;
+      }
+      partial.session.MaintainConnection(true);
+      while (device.ConnectionStatus() !=
+             BluetoothConnectionStatus::Connected) {
+        if (!IsCurrentConnectAttempt(bluetooth_address, connect_generation)) {
+          DisposePartialConnection(bluetooth_address, std::move(partial));
+          co_return;
+        }
+        plugin.Release();
+        co_await winrt::resume_after(std::chrono::milliseconds(250));
+        if (!plugin.Acquire()) {
+          abandon();
+          co_return;
+        }
+      }
+    }
+
+    plugin.Release();
     auto services_result =
         co_await device.GetGattServicesAsync(BluetoothCacheMode::Uncached);
+    if (!plugin.Acquire()) {
+      abandon();
+      co_return;
+    }
     // Creating a BluetoothLEDevice does not itself establish a connection.
     // The first uncached service query initiates it, but an immediate
     // post-scan query can transiently return Unreachable. Retry only that
@@ -1877,10 +1953,15 @@ fire_and_forget UniversalBlePlugin::ConnectAsync(uint64_t bluetooth_address,
           "ConnectionLog: GATT services temporarily unreachable; retrying " +
           std::to_string(retry + 1) + "/" +
           std::to_string(kGattReadinessRetries));
+      plugin.Release();
       co_await winrt::resume_after(
           std::chrono::milliseconds(250 * (retry + 1)));
       services_result =
           co_await device.GetGattServicesAsync(BluetoothCacheMode::Uncached);
+      if (!plugin.Acquire()) {
+        abandon();
+        co_return;
+      }
     }
     // Discovery failures report the generic status message rather than the ATT
     // code in `services_result.ProtocolError()` (unlike the read/write paths,
@@ -1890,12 +1971,7 @@ fire_and_forget UniversalBlePlugin::ConnectAsync(uint64_t bluetooth_address,
     auto services_result_error =
         gatt_communication_status_to_error(services_result.Status());
     if (services_result_error.has_value()) {
-      try {
-        DisposePartialConnection(bluetooth_address, std::move(device), {},
-                                 std::nullopt, std::nullopt);
-      } catch (...) {
-        log_and_swallow_unknown("ConnectAsync failed-service-query close");
-      }
+      DisposePartialConnection(bluetooth_address, std::move(partial));
       NotifyConnectFailureIfCurrent(
           bluetooth_address, connect_generation,
           "Failed to get services: " + services_result_error.value());
@@ -1904,27 +1980,24 @@ fire_and_forget UniversalBlePlugin::ConnectAsync(uint64_t bluetooth_address,
 
     UniversalBleLogger::LogInfo("ConnectionLog: Services discovered");
     const auto discovery = std::make_shared<GattDiscovery>();
+    plugin.Release();
     co_await DiscoverCharacteristicsAsync(services_result.Services(),
                                           BluetoothCacheMode::Uncached,
                                           discovery);
-    gatt_map = std::move(discovery->map);
-    const auto &gatt_discovery_error = discovery->error;
-
-    if (gatt_discovery_error.has_value()) {
-      try {
-        DisposePartialConnection(bluetooth_address, std::move(device),
-                                 std::move(gatt_map), std::nullopt,
-                                 std::nullopt);
-      } catch (...) {
-        log_and_swallow_unknown("ConnectAsync failed-discovery close");
-      }
+    partial.gatt_map = std::move(discovery->map);
+    if (!plugin.Acquire()) {
+      abandon();
+      co_return;
+    }
+    if (discovery->error.has_value()) {
+      DisposePartialConnection(bluetooth_address, std::move(partial));
       NotifyConnectFailureIfCurrent(bluetooth_address, connect_generation,
-                                    gatt_discovery_error.value());
+                                    discovery->error.value());
       co_return;
     }
 
     const auto connection_callback_operations = callback_operations_;
-    connection_status_changed_token = device.ConnectionStatusChanged(
+    partial.connection_status_changed_token = device.ConnectionStatusChanged(
         [this, connection_callback_operations](const BluetoothLEDevice &sender,
                                                const IInspectable &args) {
           const auto callback = connection_callback_operations.TryAcquire();
@@ -1933,7 +2006,7 @@ fire_and_forget UniversalBlePlugin::ConnectAsync(uint64_t bluetooth_address,
           BluetoothLeDeviceConnectionStatusChanged(sender, args);
         });
     const auto services_callback_operations = callback_operations_;
-    gatt_services_changed_token = device.GattServicesChanged(
+    partial.gatt_services_changed_token = device.GattServicesChanged(
         [this, services_callback_operations](const BluetoothLEDevice &sender,
                                              const IInspectable &args) {
           const auto callback = services_callback_operations.TryAcquire();
@@ -1943,8 +2016,12 @@ fire_and_forget UniversalBlePlugin::ConnectAsync(uint64_t bluetooth_address,
           BluetoothLeDeviceGattServicesChanged(sender, args);
         });
     device_agent = std::make_shared<BluetoothDeviceAgent>(
-        bluetooth_address, device, connection_status_changed_token.value(),
-        gatt_services_changed_token.value(), std::move(gatt_map));
+        bluetooth_address, device,
+        partial.connection_status_changed_token.value(),
+        partial.gatt_services_changed_token.value(),
+        std::move(partial.gatt_map));
+    device_agent->session = partial.session;
+    device_agent->auto_connect = auto_connect;
     std::shared_ptr<BluetoothDeviceAgent> previous_device_agent;
     if (!InstallConnectedDevice(bluetooth_address, connect_generation,
                                 device_agent, previous_device_agent)) {
@@ -1962,21 +2039,30 @@ fire_and_forget UniversalBlePlugin::ConnectAsync(uint64_t bluetooth_address,
           connect_generation);
     }
   } catch (const hresult_error &err) {
-    dispose_partial_connection();
-    NotifyConnectFailureIfCurrent(
-        bluetooth_address, connect_generation,
-        "ConnectAsync hresult_error hr=" + std::to_string(err.code()) +
-            " msg=" + to_string(err.message()));
+    failure = "ConnectAsync hresult_error hr=" + std::to_string(err.code()) +
+              " msg=" + to_string(err.message());
   } catch (const std::exception &ex) {
-    dispose_partial_connection();
-    NotifyConnectFailureIfCurrent(
-        bluetooth_address, connect_generation,
-        std::string("ConnectAsync std::exception: ") + ex.what());
+    failure = std::string("ConnectAsync std::exception: ") + ex.what();
   } catch (...) {
-    dispose_partial_connection();
-    NotifyConnectFailureIfCurrent(bluetooth_address, connect_generation,
-                                  "ConnectAsync unknown exception");
+    failure = "ConnectAsync unknown exception";
   }
+  if (!failure.has_value())
+    co_return;
+  // An await can throw while the lease is released.
+  if (!plugin.Held() && !plugin.Acquire()) {
+    abandon();
+    co_return;
+  }
+  Attempt("ConnectAsync partial cleanup", [&] {
+    if (device_agent) {
+      CleanConnection(bluetooth_address, &device);
+      DisposeConnection(device_agent);
+    } else {
+      DisposePartialConnection(bluetooth_address, std::move(partial));
+    }
+  });
+  NotifyConnectFailureIfCurrent(bluetooth_address, connect_generation,
+                                failure.value());
 }
 
 // Builds the characteristic map for `services`. Windows reserves some services
@@ -2173,10 +2259,20 @@ void UniversalBlePlugin::BluetoothLeDeviceConnectionStatusChanged(
   try {
     const auto bluetooth_address = sender.BluetoothAddress();
     if (sender.ConnectionStatus() == BluetoothConnectionStatus::Disconnected) {
+      const auto device_agent = GetConnectedDevice(bluetooth_address);
+      const bool reconnect = device_agent && device_agent->device == sender &&
+                             device_agent->auto_connect;
       uint64_t disconnect_generation = 0;
       if (CleanConnection(bluetooth_address, &sender, &disconnect_generation)) {
         NotifyConnectionChanged(bluetooth_address, false, std::nullopt,
                                 disconnect_generation);
+        if (reconnect) {
+          // Queued behind the disconnect event above, which a newer connect
+          // generation would otherwise suppress.
+          ui_thread_handler_.Post([this, bluetooth_address] {
+            StartConnect(bluetooth_address, true);
+          });
+        }
       } else {
         UniversalBleLogger::LogDebug(
             "Ignoring stale connection status callback");
@@ -2369,179 +2465,121 @@ void UniversalBlePlugin::DisposeConnection(
   if (!device_agent || !device_agent->Deactivate()) {
     return;
   }
-  const auto cleanup = cleanup_operations_.TryAcquire();
-  if (!cleanup.has_value()) {
-    // Shutdown must schedule every disposal before closing this tracker.
-    // Keep the agent inactive even if that ordering is accidentally violated.
-    try {
-      UniversalBleLogger::LogError(
-          "DisposeConnection: cleanup tracker closed before disposal was "
-          "scheduled");
-    } catch (...) {
-    }
-    return;
-  }
   AsyncOperationTracker::Lease reservation;
   {
     std::lock_guard<std::mutex> lock(connected_devices_mutex_);
-    // Partial connections that were never installed also need serialization.
-    if (!device_agent->cleanup_reservation) {
-      device_agent->cleanup_reservation =
-          ReserveAddressCleanupLocked(device_agent->bluetooth_address);
-    }
     reservation = std::move(device_agent->cleanup_reservation);
   }
-  // WinRT GATT Close can synchronously wait for COM teardown. Calling it on
-  // Flutter's STA can deadlock when a peripheral disconnect arrives during
-  // that wait. Invalidate the agent now, but dispose its owned objects on MTA.
-  DisposeConnectionAsync(device_agent, cleanup.value(), std::move(reservation));
-}
-
-fire_and_forget UniversalBlePlugin::DisposeConnectionAsync(
-    std::shared_ptr<BluetoothDeviceAgent> device_agent,
-    AsyncOperationTracker::Lease cleanup_lease,
-    AsyncOperationTracker::Lease connection_cleanup_lease) {
-  // The coroutine frame owns the agent and leases. No plugin pointer is
-  // captured. Shutdown may leave this worker running with the DLL pinned.
-  try {
-    co_await winrt::resume_background();
-    try {
-      device_agent->device.ConnectionStatusChanged(
-          device_agent->connection_status_changed_token);
-    } catch (const hresult_error &err) {
-      UniversalBleLogger::LogError("DisposeConnection hresult_error: " +
-                                   to_string(err.message()));
-    } catch (...) {
-      UniversalBleLogger::LogWarning(
-          "DisposeConnection: failed to remove connection status handler");
-    }
-    try {
-      device_agent->device.GattServicesChanged(
-          device_agent->gatt_services_changed_token);
-    } catch (const hresult_error &err) {
-      UniversalBleLogger::LogError(
-          "DisposeConnection GattServicesChanged hresult_error: " +
-          to_string(err.message()));
-    } catch (...) {
-      UniversalBleLogger::LogWarning(
-          "DisposeConnection: failed to remove GATT services handler");
-    }
-    DisposeServices(device_agent);
-    try {
-      device_agent->device.Close();
-    } catch (const hresult_error &err) {
-      UniversalBleLogger::LogError("DisposeConnection close hresult_error: " +
-                                   to_string(err.message()));
-    } catch (...) {
-      UniversalBleLogger::LogWarning(
-          "DisposeConnection: failed to close Bluetooth device");
-    }
-  } catch (...) {
-    // Includes failed thread-pool submission and exceptions from diagnostics.
-    // Do not continue cleanup on the caller's UI apartment if scheduling fails.
-    try {
-      log_and_swallow_unknown("DisposeConnectionAsync");
-    } catch (...) {
-    }
-  }
-  // Release every old object before allowing another discovery for the address.
-  device_agent.reset();
-  connection_cleanup_lease.reset();
+  CloseConnection(device_agent->bluetooth_address,
+                  {device_agent->device, device_agent->session,
+                   device_agent->TakeGattMap(),
+                   device_agent->connection_status_changed_token,
+                   device_agent->gatt_services_changed_token},
+                  std::move(reservation));
 }
 
 void UniversalBlePlugin::DisposePartialConnection(
-    const uint64_t bluetooth_address, BluetoothLEDevice device,
-    std::unordered_map<std::string, GattServiceObject> gatt_map,
-    std::optional<event_token> connection_status_changed_token,
-    std::optional<event_token> gatt_services_changed_token) {
-  if (!device && gatt_map.empty()) {
+    const uint64_t bluetooth_address, ClosingConnection closing) {
+  if (!closing.device && closing.gatt_map.empty()) {
     return;
   }
+  CloseConnection(bluetooth_address, std::move(closing), nullptr);
+}
+
+// WinRT GATT Close can synchronously wait for COM teardown. Calling it on
+// Flutter's STA can deadlock when a peripheral disconnect arrives during that
+// wait, e.g. when a peripheral that is rebooting drops the link mid-discovery.
+// The objects are closed on the thread pool instead, and the address's cleanup
+// reservation is held until that has finished so a reconnect waits for it.
+void UniversalBlePlugin::CloseConnection(
+    const uint64_t bluetooth_address, ClosingConnection closing,
+    AsyncOperationTracker::Lease reservation) {
   const auto cleanup = cleanup_operations_.TryAcquire();
   if (!cleanup.has_value()) {
-    // Shutdown has closed the tracker; dropping the references is all that
-    // is left, as for an agent in DisposeConnection.
-    try {
+    // Shutdown schedules every disposal before closing this tracker. If that
+    // ordering is ever violated, dropping the references is all that is left.
+    Attempt("CloseConnection", [] {
       UniversalBleLogger::LogError(
-          "DisposePartialConnection: cleanup tracker closed before disposal "
-          "was scheduled");
-    } catch (...) {
-    }
+          "CloseConnection: cleanup tracker closed before disposal was "
+          "scheduled");
+    });
     return;
   }
-  AsyncOperationTracker::Lease reservation;
-  {
+  if (!reservation) {
     std::lock_guard<std::mutex> lock(connected_devices_mutex_);
     reservation = ReserveAddressCleanupLocked(bluetooth_address);
   }
-  // A failed connect attempt can run on Flutter's STA. Closing there can
-  // deadlock the same way as disconnect teardown (see DisposeConnection),
-  // e.g. when a peripheral that is rebooting drops the link mid-discovery.
-  DisposePartialConnectionAsync(
-      std::move(device), std::move(gatt_map), connection_status_changed_token,
-      gatt_services_changed_token, cleanup.value(), std::move(reservation));
+  CloseConnectionAsync(std::move(closing), cleanup.value(),
+                       std::move(reservation));
 }
 
-fire_and_forget UniversalBlePlugin::DisposePartialConnectionAsync(
-    BluetoothLEDevice device,
-    std::unordered_map<std::string, GattServiceObject> gatt_map,
-    std::optional<event_token> connection_status_changed_token,
-    std::optional<event_token> gatt_services_changed_token,
-    AsyncOperationTracker::Lease cleanup_lease,
+// The coroutine frame owns the WinRT objects and leases. No plugin pointer is
+// captured: shutdown may leave this worker running with the DLL pinned.
+fire_and_forget UniversalBlePlugin::CloseConnectionAsync(
+    ClosingConnection closing, AsyncOperationTracker::Lease cleanup_lease,
     AsyncOperationTracker::Lease connection_cleanup_lease) {
   try {
     co_await winrt::resume_background();
-    if (device && connection_status_changed_token.has_value()) {
-      try {
-        device.ConnectionStatusChanged(connection_status_changed_token.value());
-      } catch (const hresult_error &err) {
-        UniversalBleLogger::LogError(
-            "DisposePartialConnection ConnectionStatusChanged "
-            "hresult_error hr=" +
-            std::to_string(err.code()) + " msg=" + to_string(err.message()));
-      } catch (...) {
-        UniversalBleLogger::LogWarning("DisposePartialConnection: failed to "
-                                       "remove connection status handler");
+    auto &device = closing.device;
+    if (device && closing.connection_status_changed_token.has_value()) {
+      Attempt("CloseConnection remove connection status handler", [&] {
+        device.ConnectionStatusChanged(
+            closing.connection_status_changed_token.value());
+      });
+    }
+    if (device && closing.gatt_services_changed_token.has_value()) {
+      Attempt("CloseConnection remove GATT services handler", [&] {
+        device.GattServicesChanged(
+            closing.gatt_services_changed_token.value());
+      });
+    }
+    // Tell the peripheral to stop notifying, as Microsoft's GATT client sample
+    // does before closing. Only while the link is up: a write to a device that
+    // is already gone would wait out the Windows GATT timeout for nothing.
+    bool connected = false;
+    Attempt("CloseConnection read connection status", [&] {
+      connected = device && device.ConnectionStatus() ==
+                                BluetoothConnectionStatus::Connected;
+    });
+    if (connected) {
+      for (auto &[service_id, service] : closing.gatt_map) {
+        for (auto &[char_id, characteristic] : service.characteristics) {
+          if (!characteristic.subscription_token.has_value())
+            continue;
+          try {
+            co_await characteristic.obj
+                .WriteClientCharacteristicConfigurationDescriptorAsync(
+                    GattClientCharacteristicConfigurationDescriptorValue::
+                        None);
+          } catch (...) {
+            Attempt("CloseConnection", [&] {
+              UniversalBleLogger::LogWarning(
+                  "CloseConnection: could not unsubscribe " + char_id);
+            });
+          }
+        }
       }
     }
-    if (device && gatt_services_changed_token.has_value()) {
-      try {
-        device.GattServicesChanged(gatt_services_changed_token.value());
-      } catch (const hresult_error &err) {
-        UniversalBleLogger::LogError(
-            "DisposePartialConnection GattServicesChanged hresult_error hr=" +
-            std::to_string(err.code()) + " msg=" + to_string(err.message()));
-      } catch (...) {
-        UniversalBleLogger::LogWarning(
-            "DisposePartialConnection: failed to remove GATT services handler");
-      }
+    DisposeGattMap(std::move(closing.gatt_map));
+    if (closing.session) {
+      Attempt("CloseConnection close GATT session", [&] {
+        closing.session.MaintainConnection(false);
+        closing.session.Close();
+      });
     }
-    DisposeGattMap(std::move(gatt_map));
     if (device) {
-      try {
-        device.Close();
-      } catch (const hresult_error &err) {
-        UniversalBleLogger::LogError(
-            "DisposePartialConnection close hresult_error: " +
-            to_string(err.message()));
-      } catch (...) {
-        log_and_swallow_unknown("DisposePartialConnection close");
-      }
+      Attempt("CloseConnection close Bluetooth device",
+              [&] { device.Close(); });
     }
   } catch (...) {
-    // Do not continue cleanup on the caller's UI apartment if scheduling fails.
-    try {
-      log_and_swallow_unknown("DisposePartialConnectionAsync");
-    } catch (...) {
-    }
+    // Thread-pool submission failed. Do not close WinRT objects on the UI
+    // apartment instead.
+    Attempt("CloseConnectionAsync",
+            [] { log_and_swallow_unknown("CloseConnectionAsync"); });
   }
-  device = nullptr;
+  // Release every old object before allowing another discovery for the address.
+  closing = {};
   connection_cleanup_lease.reset();
-}
-
-void UniversalBlePlugin::DisposeServices(
-    const std::shared_ptr<BluetoothDeviceAgent> &device_agent) {
-  DisposeGattMap(device_agent->TakeGattMap());
 }
 
 void UniversalBlePlugin::DisposeGattMap(
@@ -2551,17 +2589,10 @@ void UniversalBlePlugin::DisposeGattMap(
     for (auto &[char_id, characteristic] : service.characteristics) {
       if (characteristic.subscription_token.has_value() &&
           !characteristic.notification_operation_in_progress) {
-        try {
+        Attempt("DisposeGattMap unsubscribe", [&] {
           characteristic.obj.ValueChanged(
               characteristic.subscription_token.value());
-        } catch (const hresult_error &err) {
-          UniversalBleLogger::LogError("DisposeServices hresult_error unsub " +
-                                       to_string(err.message()));
-        } catch (const std::exception &ex) {
-          log_and_swallow("DisposeServices unsub std::exception", ex);
-        } catch (...) {
-          log_and_swallow_unknown("DisposeServices unsub");
-        }
+        });
         characteristic.subscription_token = std::nullopt;
       }
     }
@@ -2570,17 +2601,7 @@ void UniversalBlePlugin::DisposeGattMap(
         std::find(retained_services->begin(), retained_services->end(),
                   service.obj) != retained_services->end();
     if (!is_retained) {
-      try {
-        service.obj.Close();
-      } catch (const hresult_error &err) {
-        UniversalBleLogger::LogError("DisposeServices hresult_error close " +
-                                     service_id + ": " +
-                                     to_string(err.message()));
-      } catch (const std::exception &ex) {
-        log_and_swallow("DisposeServices close std::exception", ex);
-      } catch (...) {
-        log_and_swallow_unknown("DisposeServices close");
-      }
+      Attempt("DisposeGattMap close service", [&] { service.obj.Close(); });
     }
   }
 }
