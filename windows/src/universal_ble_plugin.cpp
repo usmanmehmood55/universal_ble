@@ -383,13 +383,6 @@ std::optional<FlutterError> UniversalBlePlugin::StartScan(
       } catch (...) {
         log_and_swallow_unknown("StartScan AllowExtendedAdvertisements");
       }
-      resetScanFilter();
-
-      if (filter != nullptr) {
-        UniversalBleLogger::LogInfo("Using Custom Scan Filter");
-        setScanFilter(*filter);
-      }
-
       const auto callback_operations = callback_operations_;
       bluetooth_le_watcher_received_token_ = bluetooth_le_watcher_.Received(
           [this, callback_operations](const auto &sender, const auto &args) {
@@ -398,6 +391,13 @@ std::optional<FlutterError> UniversalBlePlugin::StartScan(
               return;
             BluetoothLeWatcherReceived(sender, args);
           });
+    }
+    // Applied on every start, so a scan restarted without stopScan() does not
+    // keep the previous filter.
+    resetScanFilter();
+    if (filter != nullptr) {
+      UniversalBleLogger::LogInfo("Using Custom Scan Filter");
+      setScanFilter(*filter);
     }
     bluetooth_le_watcher_.Start();
     return std::nullopt;
@@ -1214,6 +1214,7 @@ void UniversalBlePlugin::InitializeAsync() {
                   RadioStateChanged(sender, args);
                 });
             RadioStateChanged(bluetooth_radio_, nullptr);
+            LoadPeripheralSupportAsync();
           } else {
             UniversalBleLogger::LogError("Bluetooth is not available");
             callback_channel_->OnAvailabilityChanged(
@@ -3191,9 +3192,35 @@ ErrorOr<PeripheralAdvertisingState> UniversalBlePlugin::GetAdvertisingState() {
 
 ErrorOr<PeripheralReadinessState> UniversalBlePlugin::GetReadinessState() {
   if (!bluetooth_radio_) {
+    return initialized_ ? PeripheralReadinessState::kUnsupported
+                        : PeripheralReadinessState::kUnknown;
+  }
+  // Peripheral role depends on the adapter. Until the adapter has answered,
+  // assume it is supported, as before.
+  if (!peripheral_role_supported_.value_or(true)) {
     return PeripheralReadinessState::kUnsupported;
   }
+  if (bluetooth_radio_.State() != RadioState::On) {
+    return PeripheralReadinessState::kBluetoothOff;
+  }
   return PeripheralReadinessState::kReady;
+}
+
+fire_and_forget UniversalBlePlugin::LoadPeripheralSupportAsync() {
+  ScopedLease plugin(callback_operations_);
+  if (!plugin.Acquire())
+    co_return;
+  try {
+    plugin.Release();
+    const auto adapter = co_await BluetoothAdapter::GetDefaultAsync();
+    if (!plugin.Acquire())
+      co_return;
+    if (adapter) {
+      peripheral_role_supported_ = adapter.IsPeripheralRoleSupported();
+    }
+  } catch (...) {
+    // The state stays unknown and is treated as supported.
+  }
 }
 
 std::optional<FlutterError> UniversalBlePlugin::StopAdvertising() {
@@ -3961,9 +3988,8 @@ fire_and_forget UniversalBlePlugin::PeripheralReadRequestedAsync(
     }
     auto request = co_await args.GetRequestAsync();
     if (request == nullptr) {
-      // No access allowed to the device.  Application should indicate this to
-      // the user.
-      std::cout << "No access allowed to the device" << std::endl;
+      UniversalBleLogger::LogError(
+          "PERIPHERAL_READ_REQ: no access to the requesting device");
       deferral.Complete();
       co_return;
     }
@@ -3976,26 +4002,25 @@ fire_and_forget UniversalBlePlugin::PeripheralReadRequestedAsync(
           peripheral_channel->OnReadRequest(
               device_id, characteristicId, nullptr, offset, value_arg,
               // SuccessCallback
+              // Responding throws when the request was cancelled or timed
+              // out meanwhile. The deferral is completed either way.
               [request, deferral](const PeripheralReadRequestResult *result) {
-                if (result != nullptr) {
-                  if (result->status() != nullptr) {
+                Attempt("PERIPHERAL_READ_REQ response", [&] {
+                  if (result == nullptr) {
+                    request.RespondWithProtocolError(0x01);
+                  } else if (result->status() != nullptr) {
                     request.RespondWithProtocolError(
                         ToGattProtocolError(*result->status()));
-                    deferral.Complete();
-                    return;
+                  } else {
+                    request.RespondWithValue(from_bytevc(result->value()));
                   }
-                  DataWriter writer;
-                  writer.ByteOrder(ByteOrder::LittleEndian);
-                  writer.WriteBuffer(from_bytevc(result->value()));
-                  request.RespondWithValue(writer.DetachBuffer());
-                } else {
-                  request.RespondWithProtocolError(0x01);
-                }
+                });
                 deferral.Complete();
               },
               // ErrorCallback
               [request, deferral](const FlutterError &error) {
-                request.RespondWithProtocolError(0x0E);
+                Attempt("PERIPHERAL_READ_REQ error response",
+                        [&] { request.RespondWithProtocolError(0x0E); });
                 deferral.Complete();
               });
         });

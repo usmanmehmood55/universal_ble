@@ -417,6 +417,8 @@ private:
   // Protected by connected_devices_mutex_; leases outlive map removal.
   std::unordered_map<uint64_t, AsyncOperationTracker> connection_cleanup_;
   Radio bluetooth_radio_{nullptr};
+  // Unset until the default adapter has reported it.
+  std::optional<bool> peripheral_role_supported_;
   RadioState old_radio_state_ = RadioState::Unknown;
   BluetoothLEAdvertisementWatcher bluetooth_le_watcher_{nullptr};
 
@@ -489,6 +491,7 @@ private:
 
   void RadioStateChanged(const Radio &sender, const IInspectable &);
   fire_and_forget LoadPairedDevicesAsync();
+  fire_and_forget LoadPeripheralSupportAsync();
   void PushUniversalScanResult(UniversalBleScanResult scan_result,
                                std::optional<bool> is_connectable,
                                bool is_scan_response);
