@@ -33,13 +33,7 @@ using universal_ble::UniversalBleCallbackChannel;
 using universal_ble::UniversalBlePlatformChannel;
 using universal_ble::UniversalBleScanResult;
 
-const auto is_connectable_key =
-    L"System.Devices.Aep.Bluetooth.Le.IsConnectable";
-const auto is_connected_key = L"System.Devices.Aep.IsConnected";
-const auto is_paired_key = L"System.Devices.Aep.IsPaired";
-const auto is_present_key = L"System.Devices.Aep.IsPresent";
 const auto device_address_key = L"System.Devices.Aep.DeviceAddress";
-const auto signal_strength_key = L"System.Devices.Aep.SignalStrength";
 
 namespace {
 template <typename Reply, typename Value>
@@ -338,22 +332,9 @@ std::optional<FlutterError> UniversalBlePlugin::StartScan(
   }
 
   try {
-    SetupDeviceWatcher();
     scan_results_.clear();
     connectable_heard_.clear();
-    const DeviceWatcherStatus device_watcher_status = device_watcher_.Status();
-    // std::cout << "DeviceWatcherState: " <<
-    // DeviceWatcherStatusToString(deviceWatcherStatus) << std::endl;
-    // DeviceWatcher can only start if its in Created, Stopped, or Aborted state
-    if (device_watcher_status == DeviceWatcherStatus::Created ||
-        device_watcher_status == DeviceWatcherStatus::Stopped ||
-        device_watcher_status == DeviceWatcherStatus::Aborted) {
-      device_watcher_.Start();
-    } else if (device_watcher_status == DeviceWatcherStatus::Stopping) {
-      return create_flutter_error(
-          UniversalBleErrorCode::kStoppingScanInProgress,
-          "StoppingScan in progress");
-    }
+    LoadPairedDevicesAsync();
 
     // Setup LeWatcher and apply filters
     if (!bluetooth_le_watcher_) {
@@ -426,7 +407,6 @@ std::optional<FlutterError> UniversalBlePlugin::StopScan() {
       }
     }
     bluetooth_le_watcher_ = nullptr;
-    DisposeDeviceWatcher();
     scan_results_.clear();
     connectable_heard_.clear();
     return std::nullopt;
@@ -1526,230 +1506,39 @@ void UniversalBlePlugin::PushUniversalScanResult(
   }
 }
 
-void UniversalBlePlugin::SetupDeviceWatcher() {
-  if (device_watcher_ != nullptr)
-    return;
-
-  device_watcher_ = DeviceInformation::CreateWatcher(
-      L"(System.Devices.Aep.ProtocolId:=\"{bb7bb05e-5972-42b5-94fc-"
-      L"76eaa7084d49}\")",
-      {
-          device_address_key,
-          is_connected_key,
-          is_paired_key,
-          is_present_key,
-          is_connectable_key,
-          signal_strength_key,
-      },
-      DeviceInformationKind::AssociationEndpoint);
-
-  /// Device Added from DeviceWatcher
-  const auto callback_operations = callback_operations_;
-  device_watcher_added_token_ = device_watcher_.Added(
-      [this, callback_operations](DeviceWatcher sender,
-                                  const DeviceInformation &device_info) {
-        const auto callback = callback_operations.TryAcquire();
-        if (!callback.has_value())
-          return;
-        try {
-          const auto properties = device_info.Properties();
-          if (!properties.HasKey(device_address_key)) {
-            return;
-          }
-          const auto device_address_property_value =
-              lookup_i_property_value(properties, device_address_key,
-                                      "DeviceAddress", "DeviceWatcher.Added");
-          if (!device_address_property_value) {
-            return;
-          }
-          const auto device_address =
-              to_string(device_address_property_value.GetString());
-          const std::string device_info_id = to_string(device_info.Id());
-          // Map Id -> MAC and MAC -> DeviceInformation
-          device_watcher_id_to_mac_.insert_or_assign(device_info_id,
-                                                     device_address);
-          device_watcher_devices_.insert_or_assign(device_address, device_info);
-          OnDeviceInfoReceived(device_info);
-        } catch (const std::exception &ex) {
-          log_and_swallow("DeviceWatcher.Added std::exception", ex);
-        } catch (...) {
-          log_and_swallow_unknown("DeviceWatcher.Added");
-        }
-      });
-
-  // Update only if device is already discovered in deviceWatcher.Added
-  device_watcher_updated_token_ = device_watcher_.Updated(
-      [this, callback_operations](
-          DeviceWatcher sender,
-          const DeviceInformationUpdate &device_info_update) {
-        const auto callback = callback_operations.TryAcquire();
-        if (!callback.has_value())
-          return;
-        try {
-          const std::string device_info_id = to_string(device_info_update.Id());
-          // Resolve MAC from Id
-          const auto mac_lookup = device_watcher_id_to_mac_.get(device_info_id);
-          if (!mac_lookup.has_value()) {
-            return;
-          }
-          const std::string mac_key = mac_lookup.value();
-          const auto it = device_watcher_devices_.get(mac_key);
-          if (it.has_value()) {
-            const auto value = it.value();
-            value.Update(device_info_update);
-            device_watcher_devices_.insert_or_assign(mac_key, value);
-            OnDeviceInfoReceived(value);
-          }
-        } catch (const std::exception &ex) {
-          log_and_swallow("DeviceWatcher.Updated std::exception", ex);
-        } catch (...) {
-          log_and_swallow_unknown("DeviceWatcher.Updated");
-        }
-      });
-
-  device_watcher_removed_token_ = device_watcher_.Removed(
-      [this, callback_operations](DeviceWatcher sender,
-                                  const DeviceInformationUpdate &args) {
-        const auto callback = callback_operations.TryAcquire();
-        if (!callback.has_value())
-          return;
-        try {
-          const std::string device_id = to_string(args.Id());
-          const auto mac_lookup = device_watcher_id_to_mac_.get(device_id);
-          if (mac_lookup.has_value()) {
-            const std::string mac_key = mac_lookup.value();
-            device_watcher_devices_.remove(mac_key);
-            device_watcher_id_to_mac_.remove(device_id);
-          }
-        } catch (const std::exception &ex) {
-          log_and_swallow("DeviceWatcher.Removed std::exception", ex);
-        } catch (...) {
-          log_and_swallow_unknown("DeviceWatcher.Removed");
-        }
-      });
-
-  device_watcher_enumeration_completed_token_ =
-      device_watcher_.EnumerationCompleted(
-          [this, callback_operations](DeviceWatcher sender, IInspectable args) {
-            const auto callback = callback_operations.TryAcquire();
-            if (!callback.has_value())
-              return;
-            UniversalBleLogger::LogInfo(
-                "DeviceWatcherEvent: EnumerationCompleted");
-            DisposeDeviceWatcher();
-            // EnumerationCompleted
-          });
-
-  device_watcher_stopped_token_ = device_watcher_.Stopped(
-      [this, callback_operations](DeviceWatcher sender, IInspectable args) {
-        const auto callback = callback_operations.TryAcquire();
-        if (!callback.has_value())
-          return;
-        // std::cout << "DeviceWatcherEvent: Stopped" << std::endl;
-        //  disposeDeviceWatcher();
-        // DeviceWatcher Stopped
-      });
-}
-
-void UniversalBlePlugin::DisposeDeviceWatcher() {
-  const auto watcher = device_watcher_;
-  device_watcher_ = nullptr;
-  if (watcher != nullptr) {
-    try {
-      watcher.Added(device_watcher_added_token_);
-    } catch (...) {
-      log_and_swallow_unknown("DisposeDeviceWatcher Added");
-    }
-    try {
-      watcher.Updated(device_watcher_updated_token_);
-    } catch (...) {
-      log_and_swallow_unknown("DisposeDeviceWatcher Updated");
-    }
-    try {
-      watcher.Removed(device_watcher_removed_token_);
-    } catch (...) {
-      log_and_swallow_unknown("DisposeDeviceWatcher Removed");
-    }
-    try {
-      watcher.EnumerationCompleted(device_watcher_enumeration_completed_token_);
-    } catch (...) {
-      log_and_swallow_unknown("DisposeDeviceWatcher EnumerationCompleted");
-    }
-    try {
-      watcher.Stopped(device_watcher_stopped_token_);
-    } catch (...) {
-      log_and_swallow_unknown("DisposeDeviceWatcher Stopped");
-    }
-    try {
-      if (watcher.Status() == DeviceWatcherStatus::Started) {
-        watcher.Stop();
-      }
-    } catch (...) {
-      log_and_swallow_unknown("DisposeDeviceWatcher Stop");
-    }
-  }
-  device_watcher_devices_.clear();
-  device_watcher_id_to_mac_.clear();
-}
-
-void UniversalBlePlugin::OnDeviceInfoReceived(
-    const DeviceInformation &device_info) {
-  const auto properties = device_info.Properties();
-
-  // Avoid devices if deviceAddressKey is not present
-  if (!properties.HasKey(device_address_key)) {
-    return;
-  }
-
-  const auto bluetooth_address_property_value = lookup_i_property_value(
-      properties, device_address_key, "DeviceAddress", "OnDeviceInfoReceived");
-  if (!bluetooth_address_property_value) {
-    return;
-  }
-
-  const std::string device_address =
-      to_string(bluetooth_address_property_value.GetString());
-
-  // Update device info if already discovered in advertisementWatcher
-  const auto it = scan_results_.get(device_address);
-  if (it.has_value()) {
-    bool is_connectable = it.value().connectable() != nullptr
-                              ? *it.value().connectable()
-                              : true;
-    if (properties.HasKey(is_connectable_key)) {
-      const auto is_connectable_property_value = lookup_i_property_value(
-          properties, is_connectable_key, "IsConnectable", "OnDeviceInfoReceived");
-      if (is_connectable_property_value) {
-        is_connectable = is_connectable_property_value.GetBoolean();
+// Scan results report whether a device is paired. Windows has no pairing
+// state in an advertisement, so the paired LE devices are listed once per scan
+// and matched by address. This replaces a DeviceWatcher that ran alongside the
+// advertisement watcher and was torn down from its own callback thread.
+fire_and_forget UniversalBlePlugin::LoadPairedDevicesAsync() {
+  const auto callback = callback_operations_.TryAcquire();
+  if (!callback.has_value())
+    co_return;
+  try {
+    paired_devices_loaded_ = false;
+    const auto devices = co_await DeviceInformation::FindAllAsync(
+        BluetoothLEDevice::GetDeviceSelectorFromPairingState(true),
+        {device_address_key});
+    paired_devices_.clear();
+    for (auto &&device_info : devices) {
+      const auto properties = device_info.Properties();
+      if (!properties.HasKey(device_address_key))
+        continue;
+      const auto address = lookup_i_property_value(
+          properties, device_address_key, "DeviceAddress", "LoadPairedDevices");
+      if (address) {
+        paired_devices_.insert_or_assign(
+            to_lower_case(to_string(address.GetString())),
+            to_string(device_info.Name()));
       }
     }
-    bool is_paired = device_info.Pairing().IsPaired();
-    if (properties.HasKey(is_paired_key)) {
-      const auto is_paired_property_value = lookup_i_property_value(
-          properties, is_paired_key, "IsPaired", "OnDeviceInfoReceived");
-      if (is_paired_property_value) {
-        is_paired = is_paired_property_value.GetBoolean();
-      }
-    }
-
-    UniversalBleScanResult universal_scan_result(device_address);
-    universal_scan_result.set_is_paired(is_paired);
-    universal_scan_result.set_connectable(is_connectable);
-
-    if (!device_info.Name().empty())
-      universal_scan_result.set_name(to_string(device_info.Name()));
-
-    if (properties.HasKey(signal_strength_key)) {
-      const auto rssi_property_value =
-          lookup_i_property_value(properties, signal_strength_key,
-                                  "SignalStrength", "OnDeviceInfoReceived");
-      if (rssi_property_value) {
-        const int16_t rssi = rssi_property_value.GetInt16();
-        universal_scan_result.set_rssi(rssi);
-      }
-    }
-
-    PushUniversalScanResult(universal_scan_result, is_connectable, false);
+    paired_devices_loaded_ = true;
+  } catch (const hresult_error &err) {
+    UniversalBleLogger::LogError(
+        "LoadPairedDevices hresult_error hr=" + std::to_string(err.code()) +
+        " msg=" + to_string(err.message()));
+  } catch (...) {
+    log_and_swallow_unknown("LoadPairedDevices");
   }
 }
 
@@ -1866,27 +1655,16 @@ void UniversalBlePlugin::BluetoothLeWatcherReceived(
       universal_scan_result.set_service_data(&service_data_map);
     }
 
-    // check if this device already discovered in deviceWatcher
-    auto it = device_watcher_devices_.get(device_id);
-    if (it.has_value()) {
-      auto &device_info = it.value();
-      auto properties = device_info.Properties();
-
-      // Update Paired Status
-      bool is_paired = device_info.Pairing().IsPaired();
-      if (properties.HasKey(is_paired_key)) {
-        const auto is_paired_property_value =
-            lookup_i_property_value(properties, is_paired_key, "IsPaired",
-                                    "BluetoothLeWatcherReceived");
-        if (is_paired_property_value) {
-          is_paired = is_paired_property_value.GetBoolean();
-        }
-      }
-      universal_scan_result.set_is_paired(is_paired);
-
-      // Update Name
-      if (name.empty() && !device_info.Name().empty())
-        universal_scan_result.set_name(to_string(device_info.Name()));
+    // Pairing state and a fallback name come from the paired-device list
+    // loaded when the scan started. Until it has loaded, the state is unknown
+    // and is left unset.
+    const auto paired_name = paired_devices_.get(device_id);
+    if (paired_name.has_value()) {
+      universal_scan_result.set_is_paired(true);
+      if (name.empty() && !paired_name.value().empty())
+        universal_scan_result.set_name(paired_name.value());
+    } else if (paired_devices_loaded_.load()) {
+      universal_scan_result.set_is_paired(false);
     }
 
     // The scan-response flag comes from the advertisement type and not from
@@ -2829,12 +2607,9 @@ void UniversalBlePlugin::ResetState() {
       bluetooth_le_watcher_ = nullptr;
     }
 
-    // Dispose device watcher and caches
-    DisposeDeviceWatcher();
     scan_results_.clear();
     connectable_heard_.clear();
-    device_watcher_devices_.clear();
-    device_watcher_id_to_mac_.clear();
+    paired_devices_.clear();
 
     // Close all connected devices and clear map
     std::vector<std::shared_ptr<BluetoothDeviceAgent>> device_agents;

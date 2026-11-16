@@ -407,7 +407,6 @@ private:
   Radio bluetooth_radio_{nullptr};
   RadioState old_radio_state_ = RadioState::Unknown;
   BluetoothLEAdvertisementWatcher bluetooth_le_watcher_{nullptr};
-  DeviceWatcher device_watcher_{nullptr};
 
   std::unordered_map<uint64_t, std::shared_ptr<BluetoothDeviceAgent>>
       connected_devices_{};
@@ -415,23 +414,18 @@ private:
   std::unordered_set<uint64_t> pending_connects_{};
   uint64_t next_connect_generation_ = 0;
   std::mutex connected_devices_mutex_;
-  ThreadSafeMap<std::string, DeviceInformation> device_watcher_devices_{};
+  // Paired LE devices by lower-case address, with their system name. Written
+  // on the platform thread, read by the advertisement callback.
+  ThreadSafeMap<std::string, std::string> paired_devices_{};
+  std::atomic<bool> paired_devices_loaded_{false};
   ThreadSafeMap<std::string, UniversalBleScanResult> scan_results_{};
   // Addresses Windows has already handed over as a *connectable* packet. A scan
   // response arrives as its own, non-connectable event; this map tracks which
   // addresses were heard as connectable so scan responses preserve their
   // connectable state.
   ThreadSafeMap<std::string, bool> connectable_heard_{};
-  // Maps DeviceInformation.Id() -> MAC address string used as key in
-  // device_watcher_devices_
-  ThreadSafeMap<std::string, std::string> device_watcher_id_to_mac_{};
 
   event_token bluetooth_le_watcher_received_token_;
-  event_token device_watcher_added_token_;
-  event_token device_watcher_updated_token_;
-  event_token device_watcher_removed_token_;
-  event_token device_watcher_enumeration_completed_token_;
-  event_token device_watcher_stopped_token_;
   event_revoker<IRadio> radio_state_changed_revoker_;
 
   void InitializeAsync();
@@ -479,15 +473,13 @@ private:
       const DevicePairingRequestedEventArgs &event_args);
 
   void RadioStateChanged(const Radio &sender, const IInspectable &);
-  void SetupDeviceWatcher();
-  void DisposeDeviceWatcher();
+  fire_and_forget LoadPairedDevicesAsync();
   void PushUniversalScanResult(UniversalBleScanResult scan_result,
                                std::optional<bool> is_connectable,
                                bool is_scan_response);
   void BluetoothLeWatcherReceived(
       const BluetoothLEAdvertisementWatcher &sender,
       const BluetoothLEAdvertisementReceivedEventArgs &args);
-  void OnDeviceInfoReceived(const DeviceInformation &device_info);
   void BluetoothLeDeviceConnectionStatusChanged(const BluetoothLEDevice &sender,
                                                 const IInspectable &args);
   void BluetoothLeDeviceGattServicesChanged(const BluetoothLEDevice &sender,
