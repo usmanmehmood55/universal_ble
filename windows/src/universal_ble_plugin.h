@@ -42,6 +42,11 @@ struct GattServiceObject {
   std::unordered_map<std::string, GattCharacteristicObject> characteristics;
 };
 
+struct GattDiscovery {
+  std::unordered_map<std::string, GattServiceObject> map;
+  std::optional<std::string> error;
+};
+
 struct GattSubscriptionSnapshot {
   uint64_t revision = 0;
   std::vector<std::pair<std::string, std::string>> characteristics;
@@ -441,6 +446,9 @@ private:
       std::function<void(UniversalBlePeripheralCallback *)> &&report);
   fire_and_forget ConnectAsync(uint64_t bluetooth_address,
                                uint64_t connect_generation);
+  static IAsyncAction DiscoverCharacteristicsAsync(
+      IVectorView<GattDeviceService> services, BluetoothCacheMode cache_mode,
+      std::shared_ptr<GattDiscovery> out);
   fire_and_forget RefreshGattServicesAsync(
       uint64_t bluetooth_address,
       std::shared_ptr<BluetoothDeviceAgent> device_agent);
@@ -448,19 +456,22 @@ private:
       std::string device_id, std::string service, std::string characteristic,
       BleInputProperty ble_input_property,
       std::function<void(std::optional<FlutterError> reply)> result);
-  fire_and_forget PairAsync(const std::string &device_id,
+  fire_and_forget PairAsync(std::string device_id,
                             std::function<void(ErrorOr<bool> reply)> result);
   fire_and_forget CustomPairAsync(
-      const std::string &device_id,
+      std::string device_id,
       std::function<void(ErrorOr<bool> reply)> result);
   static fire_and_forget GetSystemDevicesAsync(
       std::vector<std::string> with_services,
       std::function<void(ErrorOr<flutter::EncodableList> reply)> result);
+  static fire_and_forget UnPairAsync(
+      std::string device_id,
+      std::function<void(std::optional<FlutterError> reply)> result);
   static fire_and_forget IsPairedAsync(
-      const std::string &device_id,
+      std::string device_id,
       std::function<void(ErrorOr<bool> reply)> result);
   fire_and_forget DiscoverServicesAsync(
-      const std::string &device_id, bool with_descriptors,
+      std::string device_id, bool with_descriptors,
       std::function<void(ErrorOr<flutter::EncodableList> reply)> result);
 
   void PairingRequestedHandler(
@@ -564,15 +575,15 @@ private:
 
   // Peripheral helpers
   void DisposeAdvertisementPublisher();  // Requires peripheral_mutex_.
-  fire_and_forget PeripheralAddServiceAsync(const PeripheralService &service);
+  fire_and_forget PeripheralAddServiceAsync(PeripheralService service);
   fire_and_forget PeripheralReadRequestedAsync(
-      GattLocalCharacteristic const &local_char,
+      GattLocalCharacteristic local_char,
       GattReadRequestedEventArgs args);
   fire_and_forget PeripheralWriteRequestedAsync(
-      GattLocalCharacteristic const &local_char,
+      GattLocalCharacteristic local_char,
       GattWriteRequestedEventArgs args);
   fire_and_forget PeripheralSubscribedClientsChanged(
-      GattLocalCharacteristic const &local_char, IInspectable const &args);
+      GattLocalCharacteristic local_char, IInspectable args);
   void PeripheralAdvertisementStatusChanged(
       GattServiceProvider const &sender,
       GattServiceProviderAdvertisementStatusChangedEventArgs const &args);

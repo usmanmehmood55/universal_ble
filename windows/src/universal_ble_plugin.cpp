@@ -1131,33 +1131,42 @@ void UniversalBlePlugin::Pair(const std::string &device_id,
 void UniversalBlePlugin::UnPair(
     const std::string &device_id,
     std::function<void(std::optional<FlutterError> reply)> result) {
+  UnPairAsync(device_id, result);
+}
+
+// Awaited rather than waited on: a blocking wait here would freeze Flutter's
+// platform thread for as long as Windows takes to unpair.
+fire_and_forget UniversalBlePlugin::UnPairAsync(
+    std::string device_id,
+    std::function<void(std::optional<FlutterError> reply)> result) {
   try {
-    const auto device = async_get(BluetoothLEDevice::FromBluetoothAddressAsync(
-        str_to_mac_address(device_id)));
+    const auto device = co_await BluetoothLEDevice::FromBluetoothAddressAsync(
+        str_to_mac_address(device_id));
     if (device == nullptr) {
       result(create_flutter_error(UniversalBleErrorCode::kDeviceNotFound,
                                   "Unknown devicesId:" + device_id));
-      return;
+      co_return;
     }
-    const auto device_information = device.DeviceInformation();
-
-    if (!device_information.Pairing().IsPaired()) {
+    const auto pairing = device.DeviceInformation().Pairing();
+    if (!pairing.IsPaired()) {
       result(create_flutter_error(UniversalBleErrorCode::kNotPaired,
                                   "Device is not paired"));
-      return;
+      co_return;
     }
-
-    const auto device_unpairing_result =
-        async_get(device_information.Pairing().UnpairAsync());
-
-    const auto status = device_unpairing_result.Status();
+    const auto status = (co_await pairing.UnpairAsync()).Status();
     if (status != DeviceUnpairingResultStatus::Unpaired) {
       result(create_flutter_error_from_unpairing_status(status));
-      return;
+      co_return;
     }
     result(std::nullopt);
   } catch (const FlutterError &err) {
     result(err);
+  } catch (const hresult_error &err) {
+    result(create_flutter_error(UniversalBleErrorCode::kFailed,
+                                to_string(err.message()),
+                                std::to_string(err.code())));
+  } catch (...) {
+    result(create_flutter_unknown_error());
   }
 }
 
@@ -1260,7 +1269,7 @@ void UniversalBlePlugin::InitializeAsync() {
 }
 
 fire_and_forget UniversalBlePlugin::PairAsync(
-    const std::string &device_id,
+    std::string device_id,
     const std::function<void(ErrorOr<bool> reply)> result) {
   const auto callback = callback_operations_.TryAcquire();
   if (!callback.has_value())
@@ -1317,7 +1326,7 @@ fire_and_forget UniversalBlePlugin::PairAsync(
 }
 
 fire_and_forget UniversalBlePlugin::CustomPairAsync(
-    const std::string &device_id,
+    std::string device_id,
     const std::function<void(ErrorOr<bool> reply)> result) {
   const auto callback = callback_operations_.TryAcquire();
   if (!callback.has_value())
@@ -2116,48 +2125,12 @@ fire_and_forget UniversalBlePlugin::ConnectAsync(uint64_t bluetooth_address,
     }
 
     UniversalBleLogger::LogInfo("ConnectionLog: Services discovered");
-    std::optional<std::string> gatt_discovery_error;
-    auto gatt_services = services_result.Services();
-    for (GattDeviceService &&service : gatt_services) {
-      try {
-        GattServiceObject gatt_service;
-        gatt_service.obj = service;
-        std::string service_uuid = guid_to_uuid(service.Uuid());
-        auto characteristics_result = co_await service.GetCharacteristicsAsync(
-            BluetoothCacheMode::Uncached);
-        auto characteristics_result_error =
-            gatt_communication_status_to_error(characteristics_result.Status());
-
-        if (characteristics_result_error.has_value()) {
-          gatt_discovery_error = "Failed to get characteristics for service " +
-                                 service_uuid + ": " +
-                                 characteristics_result_error.value();
-          break;
-        }
-        auto gatt_characteristics = characteristics_result.Characteristics();
-        for (GattCharacteristic &&characteristic : gatt_characteristics) {
-          GattCharacteristicObject gatt_characteristic;
-          gatt_characteristic.obj = characteristic;
-          gatt_characteristic.subscription_token = std::nullopt;
-          std::string characteristic_uuid = guid_to_uuid(characteristic.Uuid());
-          gatt_service.characteristics.insert_or_assign(
-              characteristic_uuid, std::move(gatt_characteristic));
-        }
-        gatt_map.insert_or_assign(service_uuid, std::move(gatt_service));
-      } catch (const hresult_error &err) {
-        gatt_discovery_error =
-            "Service discovery hresult_error hr=" + std::to_string(err.code()) +
-            " msg=" + to_string(err.message());
-        break;
-      } catch (const std::exception &ex) {
-        gatt_discovery_error =
-            std::string("Service discovery exception: ") + ex.what();
-        break;
-      } catch (...) {
-        gatt_discovery_error = "Service discovery unknown error";
-        break;
-      }
-    }
+    const auto discovery = std::make_shared<GattDiscovery>();
+    co_await DiscoverCharacteristicsAsync(services_result.Services(),
+                                          BluetoothCacheMode::Uncached,
+                                          discovery);
+    gatt_map = std::move(discovery->map);
+    const auto &gatt_discovery_error = discovery->error;
 
     if (gatt_discovery_error.has_value()) {
       try {
@@ -2228,6 +2201,59 @@ fire_and_forget UniversalBlePlugin::ConnectAsync(uint64_t bluetooth_address,
   }
 }
 
+// Builds the characteristic map for `services`. Windows reserves some services
+// for the system (HID, for one) and answers their characteristic query with
+// AccessDenied. Such a service is kept with no characteristics rather than
+// failing the device: Microsoft's GATT client sample treats it the same way.
+// Any other failure ends discovery and is reported in `out->error`; services
+// queried so far stay in `out->map` so the caller can close them.
+IAsyncAction UniversalBlePlugin::DiscoverCharacteristicsAsync(
+    IVectorView<GattDeviceService> services, BluetoothCacheMode cache_mode,
+    std::shared_ptr<GattDiscovery> out) {
+  for (GattDeviceService &&service : services) {
+    GattServiceObject gatt_service;
+    gatt_service.obj = service;
+    const auto service_uuid = guid_to_uuid(service.Uuid());
+    try {
+      const auto result = co_await service.GetCharacteristicsAsync(cache_mode);
+      const auto status = result.Status();
+      if (status == GattCommunicationStatus::AccessDenied) {
+        UniversalBleLogger::LogInfo("Service " + service_uuid +
+                                    " is restricted by Windows");
+      } else if (const auto error = gatt_communication_status_to_error(status);
+                 error.has_value()) {
+        out->error = "Failed to get characteristics for service " +
+                     service_uuid + ": " + error.value();
+      } else {
+        for (GattCharacteristic &&characteristic : result.Characteristics()) {
+          GattCharacteristicObject gatt_characteristic;
+          gatt_characteristic.obj = characteristic;
+          gatt_service.characteristics.insert_or_assign(
+              guid_to_uuid(characteristic.Uuid()),
+              std::move(gatt_characteristic));
+        }
+      }
+    } catch (const hresult_error &err) {
+      if (err.code() == E_ACCESSDENIED) {
+        UniversalBleLogger::LogInfo("Service " + service_uuid +
+                                    " is restricted by Windows");
+      } else {
+        out->error = "Service discovery hresult_error hr=" +
+                     std::to_string(err.code()) +
+                     " msg=" + to_string(err.message());
+      }
+    } catch (const std::exception &ex) {
+      out->error = std::string("Service discovery exception: ") + ex.what();
+    } catch (...) {
+      out->error = "Service discovery unknown error";
+    }
+    out->map.insert_or_assign(service_uuid, std::move(gatt_service));
+    if (out->error.has_value()) {
+      co_return;
+    }
+  }
+}
+
 fire_and_forget UniversalBlePlugin::RefreshGattServicesAsync(
     const uint64_t bluetooth_address,
     std::shared_ptr<BluetoothDeviceAgent> device_agent) {
@@ -2282,33 +2308,11 @@ fire_and_forget UniversalBlePlugin::RefreshGattServicesAsync(
         UniversalBleLogger::LogError("GATT service refresh failed: " +
                                      services_error.value());
       } else {
-        std::unordered_map<std::string, GattServiceObject> replacement;
-        std::optional<std::string> discovery_error;
-        for (GattDeviceService &&service : services_result.Services()) {
-          GattServiceObject gatt_service;
-          gatt_service.obj = service;
-          const auto service_uuid = guid_to_uuid(service.Uuid());
-          const auto characteristics_result =
-              co_await service.GetCharacteristicsAsync(
-                  BluetoothCacheMode::Cached);
-          const auto characteristics_error = gatt_communication_status_to_error(
-              characteristics_result.Status());
-          if (characteristics_error.has_value()) {
-            discovery_error = "Failed to refresh characteristics for service " +
-                              service_uuid + ": " +
-                              characteristics_error.value();
-            break;
-          }
-          for (GattCharacteristic &&characteristic :
-               characteristics_result.Characteristics()) {
-            GattCharacteristicObject gatt_characteristic;
-            gatt_characteristic.obj = characteristic;
-            gatt_service.characteristics.insert_or_assign(
-                guid_to_uuid(characteristic.Uuid()),
-                std::move(gatt_characteristic));
-          }
-          replacement.insert_or_assign(service_uuid, std::move(gatt_service));
-        }
+        const auto discovery = std::make_shared<GattDiscovery>();
+        co_await DiscoverCharacteristicsAsync(
+            services_result.Services(), BluetoothCacheMode::Cached, discovery);
+        auto &replacement = discovery->map;
+        const auto &discovery_error = discovery->error;
 
         if (discovery_error.has_value()) {
           UniversalBleLogger::LogError(discovery_error.value());
@@ -2922,7 +2926,7 @@ fire_and_forget UniversalBlePlugin::GetSystemDevicesAsync(
 }
 
 fire_and_forget UniversalBlePlugin::DiscoverServicesAsync(
-    const std::string &device_id, bool with_descriptors,
+    std::string device_id, bool with_descriptors,
     std::function<void(ErrorOr<flutter::EncodableList> reply)> result) {
   const auto callback = callback_operations_.TryAcquire();
   if (!callback.has_value())
@@ -2947,9 +2951,8 @@ fire_and_forget UniversalBlePlugin::DiscoverServicesAsync(
         auto descriptors = flutter::EncodableList();
         if (with_descriptors) {
           try {
-            // move continuation to background and execute in safe thread
-            // context
-            co_await winrt::resume_background();
+            // Awaited on the platform thread, like connect, so the reply below
+            // is sent from the thread Flutter delivered the call on.
             auto descriptor_result =
                 co_await c.GetDescriptorsAsync(BluetoothCacheMode::Cached);
             if (descriptor_result.Status() ==
@@ -2959,6 +2962,11 @@ fire_and_forget UniversalBlePlugin::DiscoverServicesAsync(
                 descriptors.push_back(flutter::CustomEncodableValue(
                     UniversalBleDescriptor(to_uuidstr(descriptor.Uuid()))));
               }
+            } else {
+              UniversalBleLogger::LogError(
+                  "DiscoverServicesAsync: descriptor query for " +
+                  to_uuidstr(c.Uuid()) + " failed with status " +
+                  std::to_string(static_cast<int>(descriptor_result.Status())));
             }
           } catch (...) {
             UniversalBleLogger::LogError(
@@ -2997,7 +3005,7 @@ fire_and_forget UniversalBlePlugin::DiscoverServicesAsync(
 }
 
 fire_and_forget UniversalBlePlugin::IsPairedAsync(
-    const std::string &device_id,
+    std::string device_id,
     const std::function<void(ErrorOr<bool> reply)> result) {
   try {
     const auto device = co_await BluetoothLEDevice::FromBluetoothAddressAsync(
@@ -3827,7 +3835,7 @@ void UniversalBlePlugin::LogPeripheralNotificationResult(
 }
 
 fire_and_forget UniversalBlePlugin::PeripheralAddServiceAsync(
-    const PeripheralService &service) {
+    PeripheralService service) {
   const auto callback = callback_operations_.TryAcquire();
   if (!callback.has_value())
     co_return;
@@ -4060,7 +4068,7 @@ fire_and_forget UniversalBlePlugin::PeripheralAddServiceAsync(
 }
 
 fire_and_forget UniversalBlePlugin::PeripheralSubscribedClientsChanged(
-    GattLocalCharacteristic const &local_char, IInspectable const &) {
+    GattLocalCharacteristic local_char, IInspectable) {
   const auto callback = callback_operations_.TryAcquire();
   if (!callback.has_value())
     co_return;
@@ -4140,7 +4148,7 @@ fire_and_forget UniversalBlePlugin::PeripheralSubscribedClientsChanged(
 }
 
 fire_and_forget UniversalBlePlugin::PeripheralReadRequestedAsync(
-    GattLocalCharacteristic const &local_char,
+    GattLocalCharacteristic local_char,
     GattReadRequestedEventArgs args) {
   const auto callback = callback_operations_.TryAcquire();
   if (!callback.has_value())
@@ -4201,7 +4209,7 @@ fire_and_forget UniversalBlePlugin::PeripheralReadRequestedAsync(
 }
 
 fire_and_forget UniversalBlePlugin::PeripheralWriteRequestedAsync(
-    GattLocalCharacteristic const &localChar,
+    GattLocalCharacteristic localChar,
     GattWriteRequestedEventArgs args) {
   const auto callback = callback_operations_.TryAcquire();
   if (!callback.has_value())
