@@ -3055,12 +3055,8 @@ std::optional<FlutterError> UniversalBlePlugin::UpdateCharacteristic(
     if (characteristic_object == nullptr) {
       return FlutterError("not-found", "Characteristic not found", nullptr);
     }
-    IBuffer bytes = from_bytevc(value);
-    DataWriter writer;
-    writer.ByteOrder(ByteOrder::LittleEndian);
-    writer.WriteBuffer(bytes);
     local_char = characteristic_object->obj;
-    buffer = writer.DetachBuffer();
+    buffer = from_bytevc(value);
   }
 
   try {
@@ -3162,19 +3158,8 @@ void UniversalBlePlugin::LogPeripheralNotificationResult(
     } else {
       UniversalBleLogger::LogInfo(context + " recovered");
     }
-  } catch (const hresult_error &err) {
-    try {
-      UniversalBleLogger::LogError(
-          "PERIPHERAL_NOTIFY hresult_error hr=" + std::to_string(err.code()) +
-          " msg=" + to_string(err.message()));
-    } catch (...) {
-    }
   } catch (...) {
-    try {
-      UniversalBleLogger::LogError(
-          "PERIPHERAL_NOTIFY failed with an unknown exception");
-    } catch (...) {
-    }
+    LogCurrentException("PERIPHERAL_NOTIFY");
   }
 }
 
