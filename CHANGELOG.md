@@ -12,6 +12,12 @@
 
 ## 3.3.0
 * Windows: allow app shutdown to continue when background connection disposal stalls in WinRT (#375).
+* Windows: closing the app no longer waits for a pending connect, pairing, discovery or subscribe to time out in WinRT.
+* Windows: support `autoConnect`. The connection waits until the device is in range and is re-established after the link is lost.
+* Windows: `disconnect` clears notification and indication subscriptions on the peripheral before closing.
+* Windows: connect to devices that expose HID over GATT, a service Windows reserves for itself. The service is listed without characteristics.
+* Windows: `unpair` no longer blocks the UI thread.
+* Windows Peripheral: readiness reports `bluetoothOff` and `unsupported`, `addService` reports why a characteristic or descriptor could not be created instead of timing out, and `updateCharacteristic` reports a characteristic UUID that exists in more than one service.
 * Apple: complete service discovery when a peripheral's GATT database holds multiple services with the same UUID (#369).
 * iOS: allow turning off central state restoration via `UniversalBleCentralStateRestoration` (Boolean `NO` in `Info.plist`) while keeping the `bluetooth-central` background execution mode. When disabled, `CBCentralManager` is created without a restoration identifier and deferred lazily until first use (#370).
 

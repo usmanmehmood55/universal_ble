@@ -48,7 +48,7 @@ Looking for Bluetooth Classic? Check [universal_bluetooth_classic](https://pub.d
 | :---------------------------- | :-----: | :-: | :---: | :-----: | :---: | :-: |
 | startScan/stopScan            |   ✔️    | ✔️  |  ✔️   |   ✔️    |  ✔️   | ✔️  |
 | connect/disconnect            |   ✔️    | ✔️  |  ✔️   |   ✔️    |  ✔️   | ✔️  |
-| autoConnect                   |   ✔️    | ✔️  |  ✔️   |   —    |  —   | —  |
+| autoConnect                   |   ✔️    | ✔️  |  ✔️   |   ✔️    |  —   | —  |
 | getSystemDevices              |   ✔️    | ✔️  |  ✔️   |   ✔️    |  ✔️   | —  |
 | discoverServices              |   ✔️    | ✔️  |  ✔️   |   ✔️    |  ✔️   | ✔️  |
 | read                          |   ✔️    | ✔️  |  ✔️   |   ✔️    |  ✔️   | ✔️  |
@@ -347,6 +347,8 @@ You can enable automatic reconnection by setting the `autoConnect` parameter to 
 ```dart
 await bleDevice.connect(autoConnect: true);
 ```
+
+On Windows the connection waits until the device is in range, and a lost link is re-established after the disconnect event. Windows drops notification subscriptions with the link, so subscribe again when the connection comes back.
 
 #### Background connection events (iOS/macOS)
 
