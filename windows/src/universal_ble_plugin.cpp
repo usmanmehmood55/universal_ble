@@ -514,6 +514,24 @@ std::optional<FlutterError> UniversalBlePlugin::StartScan(
               return;
             BluetoothLeWatcherReceived(sender, args);
           });
+      // Windows stops the watcher on its own when the radio goes off or the
+      // adapter fails. Drop it then, so the next StartScan builds a new one.
+      bluetooth_le_watcher_stopped_token_ = bluetooth_le_watcher_.Stopped(
+          [this, callback_operations](
+              const BluetoothLEAdvertisementWatcher &sender,
+              const BluetoothLEAdvertisementWatcherStoppedEventArgs &args) {
+            const auto callback = callback_operations.TryAcquire();
+            if (!callback.has_value() ||
+                args.Error() == BluetoothError::Success)
+              return;
+            UniversalBleLogger::LogWarning(
+                "Scan stopped by Windows: " +
+                ParsePeripheralBluetoothError(args.Error()));
+            ui_thread_handler_.Post([this, sender] {
+              if (bluetooth_le_watcher_ == sender)
+                DisposeAdvertisementWatcher();
+            });
+          });
     }
     // Applied on every start, so a scan restarted without stopScan() does not
     // keep the previous filter.
@@ -553,6 +571,9 @@ void UniversalBlePlugin::DisposeAdvertisementWatcher() noexcept {
   Attempt("Unregister advertisement handler", [&] {
     bluetooth_le_watcher_.Received(bluetooth_le_watcher_received_token_);
   });
+  Attempt("Unregister advertisement stop handler", [&] {
+    bluetooth_le_watcher_.Stopped(bluetooth_le_watcher_stopped_token_);
+  });
   Attempt("Stop advertisement watcher", [&] { bluetooth_le_watcher_.Stop(); });
   bluetooth_le_watcher_ = nullptr;
 }
@@ -581,14 +602,8 @@ ErrorOr<BleConnectionState> UniversalBlePlugin::GetConnectionState(
       return BleConnectionState::kConnected;
     }
     return BleConnectionState::kDisconnected;
-  } catch (const hresult_error &err) {
-    return create_flutter_error(UniversalBleErrorCode::kFailed,
-                                to_string(err.message()),
-                                std::to_string(err.code()));
-  } catch (const FlutterError &err) {
-    return err;
   } catch (...) {
-    return create_flutter_unknown_error("Failed to get connection state");
+    return CurrentExceptionAsFlutterError();
   }
 }
 
@@ -896,34 +911,35 @@ void UniversalBlePlugin::UnPair(
 fire_and_forget UniversalBlePlugin::UnPairAsync(
     std::string device_id,
     std::function<void(std::optional<FlutterError> reply)> result) {
+  // Touches no plugin state; the lease is taken only to reply, since a
+  // reply after shutdown would go through a channel that is gone.
+  ScopedLease plugin(callback_operations_);
+  const auto reply = [&](std::optional<FlutterError> value) {
+    if (plugin.Acquire())
+      safe_reply("UnPair", result, std::move(value));
+  };
   try {
     const auto device = co_await BluetoothLEDevice::FromBluetoothAddressAsync(
         str_to_mac_address(device_id));
     if (device == nullptr) {
-      result(create_flutter_error(UniversalBleErrorCode::kDeviceNotFound,
+      reply(create_flutter_error(UniversalBleErrorCode::kDeviceNotFound,
                                   "Unknown deviceId: " + device_id));
       co_return;
     }
     const auto pairing = device.DeviceInformation().Pairing();
     if (!pairing.IsPaired()) {
-      result(create_flutter_error(UniversalBleErrorCode::kNotPaired,
+      reply(create_flutter_error(UniversalBleErrorCode::kNotPaired,
                                   "Device is not paired"));
       co_return;
     }
     const auto status = (co_await pairing.UnpairAsync()).Status();
     if (status != DeviceUnpairingResultStatus::Unpaired) {
-      result(create_flutter_error_from_unpairing_status(status));
+      reply(create_flutter_error_from_unpairing_status(status));
       co_return;
     }
-    result(std::nullopt);
-  } catch (const FlutterError &err) {
-    result(err);
-  } catch (const hresult_error &err) {
-    result(create_flutter_error(UniversalBleErrorCode::kFailed,
-                                to_string(err.message()),
-                                std::to_string(err.code())));
+    reply(std::nullopt);
   } catch (...) {
-    result(create_flutter_unknown_error());
+    reply(CurrentExceptionAsFlutterError());
   }
 }
 
@@ -1305,55 +1321,10 @@ void UniversalBlePlugin::BluetoothLeWatcherReceived(
         name = std::string(data_bytes.begin(), data_bytes.end());
       }
       // Extract service data
-      else if (data_type ==
-                   static_cast<uint8_t>(
-                       AdvertisementSectionType::ServiceData16BitUuids) ||
-               data_type ==
-                   static_cast<uint8_t>(
-                       AdvertisementSectionType::ServiceData32BitUuids) ||
-               data_type ==
-                   static_cast<uint8_t>(
-                       AdvertisementSectionType::ServiceData128BitUuids)) {
-        // Helper lambda to parse UUID and extract service data
-        auto parse_service_data =
-            [&](const std::vector<uint8_t> &bytes,
-                uint8_t type) -> std::pair<std::string, std::vector<uint8_t>> {
-          std::string uuid;
-          std::vector<uint8_t> data_payload;
-          size_t uuid_size = 0;
-
-          if (type == static_cast<uint8_t>(
-                          AdvertisementSectionType::ServiceData16BitUuids)) {
-            uuid_size = 2;
-          } else if (type ==
-                     static_cast<uint8_t>(
-                         AdvertisementSectionType::ServiceData32BitUuids)) {
-            uuid_size = 4;
-          } else if (type ==
-                     static_cast<uint8_t>(
-                         AdvertisementSectionType::ServiceData128BitUuids)) {
-            uuid_size = 16;
-          }
-
-          if (bytes.size() >= uuid_size) {
-            std::vector<uint8_t> uuid_bytes(bytes.begin(),
-                                            bytes.begin() + uuid_size);
-            uuid = ExpandServiceUuid(uuid_bytes, type);
-            if (bytes.size() > uuid_size) {
-              data_payload =
-                  std::vector<uint8_t>(bytes.begin() + uuid_size, bytes.end());
-            }
-          }
-
-          return {uuid, data_payload};
-        };
-
-        auto [service_uuid, service_data_bytes] =
-            parse_service_data(data_bytes, data_type);
-        if (!service_uuid.empty()) {
-          service_data_map[service_uuid] =
-              flutter::EncodableValue(service_data_bytes);
-        }
+      else if (const auto service_data =
+                   ParseServiceData(data_bytes, data_type)) {
+        service_data_map[service_data->first] =
+            flutter::EncodableValue(service_data->second);
       }
     }
 
@@ -2334,6 +2305,13 @@ void UniversalBlePlugin::ResetState() {
 fire_and_forget UniversalBlePlugin::GetSystemDevicesAsync(
     std::vector<std::string> with_services,
     std::function<void(ErrorOr<flutter::EncodableList> reply)> result) {
+  // Touches no plugin state; the lease is taken only to reply, since a
+  // reply after shutdown would go through a channel that is gone.
+  ScopedLease plugin(callback_operations_);
+  const auto reply = [&](ErrorOr<flutter::EncodableList> value) {
+    if (plugin.Acquire())
+      safe_reply("GetSystemDevices", result, std::move(value));
+  };
   try {
     auto selector = BluetoothLEDevice::GetDeviceSelectorFromConnectionStatus(
         BluetoothConnectionStatus::Connected);
@@ -2376,19 +2354,9 @@ fire_and_forget UniversalBlePlugin::GetSystemDevicesAsync(
       } catch (...) {
       }
     }
-    result(results);
-  } catch (const hresult_error &err) {
-    int error_code = err.code();
-    UniversalBleLogger::LogError(
-        "GetConnectedDeviceLog: " + to_string(err.message()) +
-        " ErrorCode: " + std::to_string(error_code));
-    result(create_flutter_error(UniversalBleErrorCode::kFailed,
-                                to_string(err.message()),
-                                std::to_string(error_code)));
+    reply(std::move(results));
   } catch (...) {
-    UniversalBleLogger::LogError("Unknown error GetSystemDevicesAsyncAsync");
-    result(create_flutter_error(UniversalBleErrorCode::kUnknownError,
-                                "Unknown error"));
+    reply(CurrentExceptionAsFlutterError());
   }
 }
 
@@ -2464,36 +2432,34 @@ fire_and_forget UniversalBlePlugin::DiscoverServicesAsync(
       co_return;
     }
     result(universal_services);
-  } catch (const hresult_error &err) {
-    const int error_code = err.code();
-    result(create_flutter_error(UniversalBleErrorCode::kFailed,
-                                "DiscoverServicesAsync failed",
-                                std::to_string(error_code)));
-  } catch (const FlutterError &err) {
-    result(err);
   } catch (...) {
-    result(create_flutter_error(UniversalBleErrorCode::kUnknownError,
-                                "Unknown error"));
+    // Every await above catches its own exceptions, so the lease is held.
+    result(CurrentExceptionAsFlutterError());
   }
 }
 
 fire_and_forget UniversalBlePlugin::IsPairedAsync(
     std::string device_id,
     const std::function<void(ErrorOr<bool> reply)> result) {
+  // Touches no plugin state; the lease is taken only to reply, since a
+  // reply after shutdown would go through a channel that is gone.
+  ScopedLease plugin(callback_operations_);
+  const auto reply = [&](ErrorOr<bool> value) {
+    if (plugin.Acquire())
+      safe_reply("IsPaired", result, std::move(value));
+  };
   try {
     const auto device = co_await BluetoothLEDevice::FromBluetoothAddressAsync(
         str_to_mac_address(device_id));
     if (device == nullptr) {
-      result(create_flutter_error(UniversalBleErrorCode::kDeviceNotFound,
+      reply(create_flutter_error(UniversalBleErrorCode::kDeviceNotFound,
                                   "Unknown deviceId: " + device_id));
       co_return;
     }
     const bool is_paired = device.DeviceInformation().Pairing().IsPaired();
-    result(is_paired);
+    reply(is_paired);
   } catch (...) {
-    UniversalBleLogger::LogError("IsPairedAsync: Error");
-    result(create_flutter_error(UniversalBleErrorCode::kUnknownError,
-                                "Unknown error"));
+    reply(CurrentExceptionAsFlutterError());
   }
 }
 
@@ -3546,53 +3512,33 @@ fire_and_forget UniversalBlePlugin::PeripheralWriteRequestedAsync(
     std::string deviceId =
         ParsePeripheralBluetoothClientId(args.Session().DeviceId().Id());
 
+    // Each property is read on its own, so one failing read still lets the
+    // request reach Dart with the others.
     int64_t offset = 0;
-    try {
-      offset = request.Offset();
-    } catch (const hresult_error &err) {
-      UniversalBleLogger::LogError("PERIPHERAL_WRITE_REQ failed offset hr=" +
-                                   std::to_string(err.code()) +
-                                   " msg=" + to_string(err.message()));
-    } catch (...) {
-      UniversalBleLogger::LogError(
-          "PERIPHERAL_WRITE_REQ failed offset unknown");
-    }
-
+    Attempt("PERIPHERAL_WRITE_REQ offset", [&] { offset = request.Offset(); });
     bool with_response = false;
-    try {
+    Attempt("PERIPHERAL_WRITE_REQ option", [&] {
       with_response = request.Option() == GattWriteOption::WriteWithResponse;
-    } catch (const hresult_error &err) {
-      UniversalBleLogger::LogError("PERIPHERAL_WRITE_REQ failed option hr=" +
-                                   std::to_string(err.code()) +
-                                   " msg=" + to_string(err.message()));
-    } catch (...) {
-      UniversalBleLogger::LogError(
-          "PERIPHERAL_WRITE_REQ failed option unknown");
-    }
-
+    });
     auto value_holder = std::make_shared<std::vector<uint8_t>>();
-    try {
+    Attempt("PERIPHERAL_WRITE_REQ value", [&] {
       if (request.Value() != nullptr) {
         *value_holder = to_bytevc(request.Value());
       }
-    } catch (const hresult_error &err) {
-      UniversalBleLogger::LogError(
-          "PERIPHERAL_WRITE_REQ failed value extraction hr=" +
-          std::to_string(err.code()) + " msg=" + to_string(err.message()));
-    } catch (...) {
-      UniversalBleLogger::LogError(
-          "PERIPHERAL_WRITE_REQ failed value extraction unknown");
-    }
+    });
 
     PostPeripheralReport(
         [characteristicId, offset, value_holder, request, deferral, deviceId,
          with_response](UniversalBlePeripheralCallback *peripheral_channel) {
           peripheral_channel->OnWriteRequest(
               deviceId, characteristicId, nullptr, offset, value_holder.get(),
-              [deferral, request, deviceId, characteristicId,
+              // A write without response takes no answer. Responding throws
+              // when the request was cancelled meanwhile; the deferral is
+              // completed either way.
+              [deferral, request,
                with_response](const PeripheralWriteRequestResult *writeResult) {
-                try {
-                  if (with_response) {
+                if (with_response) {
+                  Attempt("PERIPHERAL_WRITE_REQ response", [&] {
                     if (writeResult != nullptr &&
                         writeResult->status() != nullptr) {
                       request.RespondWithProtocolError(
@@ -3600,43 +3546,20 @@ fire_and_forget UniversalBlePlugin::PeripheralWriteRequestedAsync(
                     } else {
                       request.Respond();
                     }
-                  }
-                } catch (const hresult_error &err) {
-                  UniversalBleLogger::LogError(
-                      "PERIPHERAL_WRITE_REQ response hresult_error hr=" +
-                      std::to_string(err.code()) +
-                      " msg=" + to_string(err.message()));
-                } catch (...) {
-                  UniversalBleLogger::LogError(
-                      "PERIPHERAL_WRITE_REQ response unknown exception");
+                  });
                 }
                 deferral.Complete();
               },
-              [deferral, request, with_response](const FlutterError &error) {
-                try {
-                  if (with_response) {
-                    request.RespondWithProtocolError(0x0E);
-                  }
-                } catch (const hresult_error &err) {
-                  UniversalBleLogger::LogError(
-                      "PERIPHERAL_WRITE_REQ error-response hresult_error hr=" +
-                      std::to_string(err.code()) +
-                      " msg=" + to_string(err.message()));
-                } catch (...) {
-                  UniversalBleLogger::LogError(
-                      "PERIPHERAL_WRITE_REQ error-response unknown exception");
+              [deferral, request, with_response](const FlutterError &) {
+                if (with_response) {
+                  Attempt("PERIPHERAL_WRITE_REQ error response",
+                          [&] { request.RespondWithProtocolError(0x0E); });
                 }
                 deferral.Complete();
               });
         });
-  } catch (const hresult_error &err) {
-    UniversalBleLogger::LogError(
-        "PERIPHERAL_WRITE_REQ outer hresult_error hr=" +
-        std::to_string(err.code()) + " msg=" + to_string(err.message()));
-    deferral.Complete();
   } catch (...) {
-    UniversalBleLogger::LogError(
-        "PERIPHERAL_WRITE_REQ outer unknown exception");
+    LogCurrentException("PERIPHERAL_WRITE_REQ");
     deferral.Complete();
   }
 }

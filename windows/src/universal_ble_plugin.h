@@ -433,6 +433,7 @@ private:
   ThreadSafeMap<std::string, bool> connectable_heard_{};
 
   event_token bluetooth_le_watcher_received_token_;
+  event_token bluetooth_le_watcher_stopped_token_;
   event_revoker<IRadio> radio_state_changed_revoker_;
 
   void InitializeAsync();
@@ -464,13 +465,13 @@ private:
       std::function<void(std::optional<FlutterError> reply)> result);
   fire_and_forget PairAsync(std::string device_id, bool custom_ceremony,
                             std::function<void(ErrorOr<bool> reply)> result);
-  static fire_and_forget GetSystemDevicesAsync(
+  fire_and_forget GetSystemDevicesAsync(
       std::vector<std::string> with_services,
       std::function<void(ErrorOr<flutter::EncodableList> reply)> result);
-  static fire_and_forget UnPairAsync(
+  fire_and_forget UnPairAsync(
       std::string device_id,
       std::function<void(std::optional<FlutterError> reply)> result);
-  static fire_and_forget IsPairedAsync(
+  fire_and_forget IsPairedAsync(
       std::string device_id,
       std::function<void(ErrorOr<bool> reply)> result);
   fire_and_forget DiscoverServicesAsync(
