@@ -16,6 +16,7 @@
 #include <winrt/base.h>
 
 #include "generated/universal_ble.g.h"
+#include "address_cleanup_gate.h"
 #include "async_operation_tracker.h"
 #include "helper/universal_ble_base.h"
 #include "helper/universal_enum.h"
@@ -98,7 +99,7 @@ struct BluetoothDeviceAgent {
   const uint64_t bluetooth_address;
   // Assigned under connected_devices_mutex_ before removal, then moved into
   // the disposal coroutine by the caller that wins Deactivate().
-  AsyncOperationTracker::Lease cleanup_reservation;
+  AddressCleanupGate::Reservation cleanup_reservation;
   BluetoothLEDevice device;
   // Set only for an autoConnect connection, where it keeps the link wanted.
   GattSession session{nullptr};
@@ -405,10 +406,9 @@ private:
   // running them.
   UniversalBleUiThreadHandler ui_thread_handler_;
   AsyncOperationTracker callback_operations_;
-  AsyncOperationTracker initialization_operations_;
   AsyncOperationTracker cleanup_operations_;
-  // Protected by connected_devices_mutex_; leases outlive map removal.
-  std::unordered_map<uint64_t, AsyncOperationTracker> connection_cleanup_;
+  // Guarded by connected_devices_mutex_.
+  AddressCleanupGate cleanup_gate_;
   Radio bluetooth_radio_{nullptr};
   // Unset until the default adapter has reported it.
   std::optional<bool> peripheral_role_supported_;
@@ -527,10 +527,6 @@ private:
                        uint64_t *removed_generation = nullptr);
   void DisposeConnection(
       const std::shared_ptr<BluetoothDeviceAgent> &device_agent);
-  // Requires connected_devices_mutex_. Also prunes idle entries of other
-  // addresses.
-  AsyncOperationTracker::Lease
-  ReserveAddressCleanupLocked(uint64_t bluetooth_address);
   // Requires connected_devices_mutex_. Does not deactivate or close objects.
   void ReserveConnectionCleanupLocked(
       const std::shared_ptr<BluetoothDeviceAgent> &device_agent);
@@ -538,10 +534,10 @@ private:
   void DisposePartialConnection(uint64_t bluetooth_address,
                                 ClosingConnection closing);
   void CloseConnection(uint64_t bluetooth_address, ClosingConnection closing,
-                       AsyncOperationTracker::Lease reservation);
+                       AddressCleanupGate::Reservation reservation);
   static fire_and_forget CloseConnectionAsync(
       ClosingConnection closing, AsyncOperationTracker::Lease cleanup_lease,
-      AsyncOperationTracker::Lease connection_cleanup_lease);
+      AddressCleanupGate::Reservation connection_cleanup_lease);
   void ResetState();
   static void DisposeGattMap(
       std::unordered_map<std::string, GattServiceObject> gatt_map,

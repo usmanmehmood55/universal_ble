@@ -64,6 +64,14 @@ target_include_directories(notification_failure_log_test PRIVATE ../src)
 
 add_test(NAME notification_failure_log_test COMMAND notification_failure_log_test)
 
+# The per-address gate that makes a reconnect wait for the previous close.
+# Platform-agnostic so it runs on every host.
+add_executable(address_cleanup_gate_test address_cleanup_gate_test.cpp)
+target_compile_features(address_cleanup_gate_test PRIVATE cxx_std_20)
+target_include_directories(address_cleanup_gate_test PRIVATE ../src)
+
+add_test(NAME address_cleanup_gate_test COMMAND address_cleanup_gate_test)
+
 if(WIN32)
   add_executable(cleanup_drain_test cleanup_drain_test.cpp)
   target_compile_features(cleanup_drain_test PRIVATE cxx_std_20)

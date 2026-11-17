@@ -313,19 +313,17 @@ UniversalBlePlugin::~UniversalBlePlugin() {
   // runners link the plugin at build time and never unload it; this covers
   // hosts that load it dynamically.
   KeepModuleLoaded();
-  // Stop new WinRT callbacks from entering, let callbacks which already hold a
-  // lease finish while every member is still alive, then release owned state.
+  // Stop new callbacks from entering, let those which already hold a lease
+  // finish while every member is still alive, then release owned state.
+  //
+  // The drain does not pump messages. Pumping during engine teardown runs
+  // application code with the engine half gone (#319), and nothing needs it:
+  // no coroutine holds the lease while suspended (ScopedLease), so every
+  // lease still held belongs to code running on another thread that never
+  // waits for this one. Keep it that way: do not hold the lease across an
+  // await or block on this thread while holding it.
   callback_operations_.Close();
-  initialization_operations_.Close();
-  // Invariant: the raw system-operation Completed handler finishes
-  // independently of this UI apartment and only queues publication. Do not
-  // replace it with an apartment-affine continuation: this drain deliberately
-  // does not pump. Teardown must wait for every acquired lease to avoid
-  // destroying live state.
-  while (!initialization_operations_.WaitUntilIdleFor(
-      std::chrono::milliseconds(10))) {
-  }
-  WaitForCallbacksWithMessagePump(callback_operations_);
+  WaitForCallbacksWithoutMessagePump(callback_operations_);
   {
     std::lock_guard<std::mutex> lock(peripheral_mutex_);
     DisposeAdvertisementPublisher();
@@ -957,18 +955,17 @@ void UniversalBlePlugin::GetSystemDevices(
 /// Helper Methods
 
 void UniversalBlePlugin::InitializeAsync() {
-  const auto initialization_operations = initialization_operations_;
-  const auto publish_result = [this, initialization_operations](
+  const auto callback_operations = callback_operations_;
+  const auto publish_result = [this, callback_operations](
                                   const Radio &radio) noexcept {
     try {
-      ui_thread_handler_.Post([this, initialization_operations, radio] {
-        const auto callback = initialization_operations.TryAcquire();
+      ui_thread_handler_.Post([this, callback_operations, radio] {
+        const auto callback = callback_operations.TryAcquire();
         if (!callback.has_value())
           return;
         try {
           if (radio) {
             bluetooth_radio_ = radio;
-            const auto callback_operations = callback_operations_;
             radio_state_changed_revoker_ = bluetooth_radio_.StateChanged(
                 auto_revoke, [this, callback_operations](const auto &sender,
                                                          const auto &args) {
@@ -1003,7 +1000,7 @@ void UniversalBlePlugin::InitializeAsync() {
   try {
     // Do not keep a lease or capture the UI apartment while enumeration is
     // pending. An early close must not pump engine messages to finish startup.
-    Radio::GetRadiosAsync().Completed([initialization_operations,
+    Radio::GetRadiosAsync().Completed([callback_operations,
                                        publish_result](const auto &operation,
                                                        const auto &) {
       // The radio queries are synchronous WinRT calls that can stall, so they
@@ -1020,7 +1017,7 @@ void UniversalBlePlugin::InitializeAsync() {
       } catch (...) {
         LogCurrentException("Bluetooth initialization");
       }
-      const auto callback = initialization_operations.TryAcquire();
+      const auto callback = callback_operations.TryAcquire();
       if (!callback.has_value())
         return;
       publish_result(selected_radio);
@@ -1527,13 +1524,8 @@ fire_and_forget UniversalBlePlugin::ConnectAsync(uint64_t bluetooth_address,
         if (ConnectGenerationLocked(bluetooth_address) != connect_generation) {
           co_return;
         }
-        const auto cleanup = connection_cleanup_.find(bluetooth_address);
-        if (cleanup == connection_cleanup_.end())
+        if (!cleanup_gate_.IsClosing(bluetooth_address))
           break;
-        if (cleanup->second.IsIdle()) {
-          connection_cleanup_.erase(cleanup);
-          break;
-        }
       }
       if (std::chrono::steady_clock::now() >= cleanup_deadline) {
         NotifyConnectFailureIfCurrent(
@@ -2097,29 +2089,15 @@ bool UniversalBlePlugin::CleanConnection(
   return false;
 }
 
+// Requires connected_devices_mutex_. Taken when the agent leaves the
+// connected map, so that a reconnect cannot see the address as free between
+// that removal and the start of the close.
 void UniversalBlePlugin::ReserveConnectionCleanupLocked(
     const std::shared_ptr<BluetoothDeviceAgent> &device_agent) {
   if (device_agent->IsActive() && !device_agent->cleanup_reservation) {
     device_agent->cleanup_reservation =
-        ReserveAddressCleanupLocked(device_agent->bluetooth_address);
+        cleanup_gate_.Reserve(device_agent->bluetooth_address);
   }
-}
-
-AsyncOperationTracker::Lease UniversalBlePlugin::ReserveAddressCleanupLocked(
-    const uint64_t bluetooth_address) {
-  // Entries are otherwise only erased when the same address is connected
-  // again. Drop finished ones here so addresses that are never revisited do
-  // not accumulate. Idle entries gate nothing, and every acquisition happens
-  // under connected_devices_mutex_, so none can become busy while erased.
-  for (auto it = connection_cleanup_.begin();
-       it != connection_cleanup_.end();) {
-    if (it->first != bluetooth_address && it->second.IsIdle()) {
-      it = connection_cleanup_.erase(it);
-    } else {
-      ++it;
-    }
-  }
-  return connection_cleanup_[bluetooth_address].TryAcquire().value();
 }
 
 void UniversalBlePlugin::DisposeConnection(
@@ -2127,7 +2105,7 @@ void UniversalBlePlugin::DisposeConnection(
   if (!device_agent || !device_agent->Deactivate()) {
     return;
   }
-  AsyncOperationTracker::Lease reservation;
+  AddressCleanupGate::Reservation reservation;
   {
     std::lock_guard<std::mutex> lock(connected_devices_mutex_);
     reservation = std::move(device_agent->cleanup_reservation);
@@ -2155,7 +2133,7 @@ void UniversalBlePlugin::DisposePartialConnection(
 // reservation is held until that has finished so a reconnect waits for it.
 void UniversalBlePlugin::CloseConnection(
     const uint64_t bluetooth_address, ClosingConnection closing,
-    AsyncOperationTracker::Lease reservation) {
+    AddressCleanupGate::Reservation reservation) {
   const auto cleanup = cleanup_operations_.TryAcquire();
   if (!cleanup.has_value()) {
     // Shutdown schedules every disposal before closing this tracker. If that
@@ -2169,7 +2147,7 @@ void UniversalBlePlugin::CloseConnection(
   }
   if (!reservation) {
     std::lock_guard<std::mutex> lock(connected_devices_mutex_);
-    reservation = ReserveAddressCleanupLocked(bluetooth_address);
+    reservation = cleanup_gate_.Reserve(bluetooth_address);
   }
   CloseConnectionAsync(std::move(closing), cleanup.value(),
                        std::move(reservation));
@@ -2179,7 +2157,7 @@ void UniversalBlePlugin::CloseConnection(
 // captured: shutdown may leave this worker running with the DLL pinned.
 fire_and_forget UniversalBlePlugin::CloseConnectionAsync(
     ClosingConnection closing, AsyncOperationTracker::Lease cleanup_lease,
-    AsyncOperationTracker::Lease connection_cleanup_lease) {
+    AddressCleanupGate::Reservation connection_cleanup_lease) {
   try {
     co_await winrt::resume_background();
     auto &device = closing.device;

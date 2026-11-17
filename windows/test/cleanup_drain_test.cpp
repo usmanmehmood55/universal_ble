@@ -1,5 +1,8 @@
 #include "callback_drain.h"
 
+#include <objbase.h>
+#include <windows.h>
+
 #include <atomic>
 #include <cstdlib>
 #include <future>
