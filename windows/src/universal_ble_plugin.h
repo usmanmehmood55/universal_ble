@@ -82,7 +82,8 @@ struct PeripheralGattCharacteristicObject {
 struct PeripheralGattServiceProviderObject {
   GattServiceProvider obj = nullptr;
   winrt::event_token advertisement_status_changed_token;
-  std::map<std::string, PeripheralGattCharacteristicObject *> characteristics;
+  std::map<std::string, std::unique_ptr<PeripheralGattCharacteristicObject>>
+      characteristics;
 };
 
 enum class PeripheralBlePermission {
@@ -141,48 +142,22 @@ struct BluetoothDeviceAgent {
   GattCharacteristicObject FetchCharacteristic(
       const std::string &service_uuid, const std::string &characteristic_uuid) {
     std::lock_guard<std::mutex> lock(gatt_mutex);
-    if (!IsActive()) {
-      throw create_flutter_error(UniversalBleErrorCode::kDeviceDisconnected,
-                                 "Device disconnected");
-    }
-    const auto service = gatt_map.find(service_uuid);
-    if (service == gatt_map.end()) {
-      throw create_flutter_error(UniversalBleErrorCode::kServiceNotFound,
-                                 "Service not found");
-    }
-    const auto characteristic =
-        service->second.characteristics.find(characteristic_uuid);
-    if (characteristic == service->second.characteristics.end()) {
-      throw create_flutter_error(UniversalBleErrorCode::kCharacteristicNotFound,
-                                 "Characteristic not found");
-    }
-    return characteristic->second;
+    return *FindCharacteristicOrThrowLocked(service_uuid, characteristic_uuid);
   }
 
+  // Also holds a GATT operation lease, so a service refresh waits for the
+  // operation before closing the characteristic.
   GattCharacteristicLease FetchCharacteristicForOperation(
       const std::string &service_uuid, const std::string &characteristic_uuid) {
     std::lock_guard<std::mutex> lock(gatt_mutex);
-    if (!IsActive()) {
-      throw create_flutter_error(UniversalBleErrorCode::kDeviceDisconnected,
-                                 "Device disconnected");
-    }
-    const auto service = gatt_map.find(service_uuid);
-    if (service == gatt_map.end()) {
-      throw create_flutter_error(UniversalBleErrorCode::kServiceNotFound,
-                                 "Service not found");
-    }
-    const auto characteristic =
-        service->second.characteristics.find(characteristic_uuid);
-    if (characteristic == service->second.characteristics.end()) {
-      throw create_flutter_error(UniversalBleErrorCode::kCharacteristicNotFound,
-                                 "Characteristic not found");
-    }
+    const auto *characteristic =
+        FindCharacteristicOrThrowLocked(service_uuid, characteristic_uuid);
     const auto operation = gatt_operations.TryAcquire();
     if (!operation.has_value()) {
       throw create_flutter_error(UniversalBleErrorCode::kDeviceDisconnected,
                                  "Device disconnected");
     }
-    return {characteristic->second, operation.value()};
+    return {*characteristic, operation.value()};
   }
 
   std::vector<GattDeviceService> SnapshotGattServices() const {
@@ -296,66 +271,84 @@ struct BluetoothDeviceAgent {
                                   const std::string &characteristic_uuid,
                                   GattCharacteristicObject &characteristic) {
     std::lock_guard<std::mutex> lock(gatt_mutex);
-    if (!IsActive()) {
+    auto *found = FindCharacteristicLocked(service_uuid, characteristic_uuid);
+    if (found == nullptr || found->notification_operation_in_progress) {
       return false;
     }
-    const auto service = gatt_map.find(service_uuid);
-    if (service == gatt_map.end()) {
-      return false;
-    }
-    const auto found =
-        service->second.characteristics.find(characteristic_uuid);
-    if (found == service->second.characteristics.end() ||
-        found->second.notification_operation_in_progress) {
-      return false;
-    }
-    found->second.notification_operation_in_progress = true;
+    found->notification_operation_in_progress = true;
     ++gatt_revision;
-    characteristic = found->second;
+    characteristic = *found;
     return true;
   }
 
   bool UpdateNotificationOperationToken(
       const std::string &service_uuid, const std::string &characteristic_uuid,
       const std::optional<event_token> &subscription_token) {
-    std::lock_guard<std::mutex> lock(gatt_mutex);
-    if (!IsActive()) {
-      return false;
-    }
-    const auto service = gatt_map.find(service_uuid);
-    if (service == gatt_map.end()) {
-      return false;
-    }
-    const auto found =
-        service->second.characteristics.find(characteristic_uuid);
-    if (found == service->second.characteristics.end() ||
-        !found->second.notification_operation_in_progress) {
-      return false;
-    }
-    found->second.subscription_token = subscription_token;
-    ++gatt_revision;
-    return true;
+    return SetNotificationOperationToken(service_uuid, characteristic_uuid,
+                                         subscription_token, false);
   }
 
   bool FinishNotificationOperation(
       const std::string &service_uuid, const std::string &characteristic_uuid,
       const std::optional<event_token> &subscription_token) {
-    std::lock_guard<std::mutex> lock(gatt_mutex);
+    return SetNotificationOperationToken(service_uuid, characteristic_uuid,
+                                         subscription_token, true);
+  }
+
+private:
+  // Requires gatt_mutex. nullptr when the device is inactive or the service or
+  // characteristic is unknown.
+  GattCharacteristicObject *
+  FindCharacteristicLocked(const std::string &service_uuid,
+                           const std::string &characteristic_uuid) {
     if (!IsActive()) {
-      return false;
+      return nullptr;
     }
     const auto service = gatt_map.find(service_uuid);
     if (service == gatt_map.end()) {
-      return false;
+      return nullptr;
     }
-    const auto found =
+    const auto characteristic =
         service->second.characteristics.find(characteristic_uuid);
-    if (found == service->second.characteristics.end() ||
-        !found->second.notification_operation_in_progress) {
+    return characteristic == service->second.characteristics.end()
+               ? nullptr
+               : &characteristic->second;
+  }
+
+  // Requires gatt_mutex. Throws the FlutterError a Dart call should fail with.
+  GattCharacteristicObject *
+  FindCharacteristicOrThrowLocked(const std::string &service_uuid,
+                                  const std::string &characteristic_uuid) {
+    if (!IsActive()) {
+      throw create_flutter_error(UniversalBleErrorCode::kDeviceDisconnected,
+                                 "Device disconnected");
+    }
+    if (gatt_map.find(service_uuid) == gatt_map.end()) {
+      throw create_flutter_error(UniversalBleErrorCode::kServiceNotFound,
+                                 "Service not found");
+    }
+    auto *characteristic =
+        FindCharacteristicLocked(service_uuid, characteristic_uuid);
+    if (characteristic == nullptr) {
+      throw create_flutter_error(UniversalBleErrorCode::kCharacteristicNotFound,
+                                 "Characteristic not found");
+    }
+    return characteristic;
+  }
+
+  // Requires a notification operation in progress on the characteristic.
+  bool SetNotificationOperationToken(
+      const std::string &service_uuid, const std::string &characteristic_uuid,
+      const std::optional<event_token> &subscription_token, bool finish) {
+    std::lock_guard<std::mutex> lock(gatt_mutex);
+    auto *found = FindCharacteristicLocked(service_uuid, characteristic_uuid);
+    if (found == nullptr || !found->notification_operation_in_progress) {
       return false;
     }
-    found->second.subscription_token = subscription_token;
-    found->second.notification_operation_in_progress = false;
+    found->subscription_token = subscription_token;
+    if (finish) {
+      found->notification_operation_in_progress = false;
+    }
     ++gatt_revision;
     return true;
   }
@@ -380,8 +373,8 @@ private:
   static void ErrorCallback(const FlutterError &error) {
     // Ignore ChannelConnection Error, This might occur because of HotReload
     if (error.code() != "channel-error") {
-      std::cout << "ErrorCode: " << error.code()
-                << " Message: " << error.message() << std::endl;
+      UniversalBleLogger::LogError("Callback channel error " + error.code() +
+                                   ": " + error.message());
     }
   }
   static int64_t GetCurrentTimestampMillis() {
@@ -453,6 +446,8 @@ private:
   void PostPeripheralReport(
       std::function<void(UniversalBlePeripheralCallback *)> &&report);
   void StartConnect(uint64_t bluetooth_address, bool auto_connect);
+  // Requires connected_devices_mutex_. 0 when no attempt has been made.
+  uint64_t ConnectGenerationLocked(uint64_t bluetooth_address) const;
   bool IsCurrentConnectAttempt(uint64_t bluetooth_address,
                                uint64_t connect_generation);
   fire_and_forget ConnectAsync(uint64_t bluetooth_address,
@@ -467,11 +462,8 @@ private:
       std::string device_id, std::string service, std::string characteristic,
       BleInputProperty ble_input_property,
       std::function<void(std::optional<FlutterError> reply)> result);
-  fire_and_forget PairAsync(std::string device_id,
+  fire_and_forget PairAsync(std::string device_id, bool custom_ceremony,
                             std::function<void(ErrorOr<bool> reply)> result);
-  fire_and_forget CustomPairAsync(
-      std::string device_id,
-      std::function<void(ErrorOr<bool> reply)> result);
   static fire_and_forget GetSystemDevicesAsync(
       std::vector<std::string> with_services,
       std::function<void(ErrorOr<flutter::EncodableList> reply)> result);
@@ -485,12 +477,12 @@ private:
       std::string device_id, bool with_descriptors,
       std::function<void(ErrorOr<flutter::EncodableList> reply)> result);
 
-  void PairingRequestedHandler(
-      DeviceInformationCustomPairing sender,
+  static void PairingRequestedHandler(
       const DevicePairingRequestedEventArgs &event_args);
 
   void RadioStateChanged(const Radio &sender, const IInspectable &);
   fire_and_forget LoadPairedDevicesAsync();
+  void DisposeAdvertisementWatcher() noexcept;
   fire_and_forget LoadPeripheralSupportAsync();
   void PushUniversalScanResult(UniversalBleScanResult scan_result,
                                std::optional<bool> is_connectable,
@@ -502,6 +494,9 @@ private:
                                                 const IInspectable &args);
   void BluetoothLeDeviceGattServicesChanged(const BluetoothLEDevice &sender,
                                             const IInspectable &args);
+  // Throws a kDeviceNotFound FlutterError when the device is not connected.
+  std::shared_ptr<BluetoothDeviceAgent>
+  ConnectedDeviceOrThrow(const std::string &device_id);
   std::shared_ptr<BluetoothDeviceAgent> GetConnectedDevice(
       uint64_t bluetooth_address);
   void InvalidateConnectAttempt(uint64_t bluetooth_address);
@@ -560,7 +555,8 @@ private:
       const std::string &device_id, const std::string &characteristic_id,
       const GattValueChangedEventArgs &args);
   // Peripheral runtime state
-  std::map<std::string, PeripheralGattServiceProviderObject *>
+  // Guarded by peripheral_mutex_. Pointers into it must not outlive the lock.
+  std::map<std::string, std::unique_ptr<PeripheralGattServiceProviderObject>>
       peripheral_service_provider_map_{};
   /// Lowercased service UUIDs from the last successful `StartAdvertising` call.
   /// Empty means all registered services were selected.

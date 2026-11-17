@@ -3,6 +3,8 @@
 #include <windows.h>
 #include <tchar.h>
 
+#include "helper/universal_ble_logger.h"
+
 namespace universal_ble {
 typedef struct SizeAndPos_s {
   int x, y, width, height;
@@ -63,7 +65,7 @@ hstring askForPairingPin() {
 
   // Register the window class
   if (!RegisterClass(&mainWindowClass)) {
-    std::cout << "PinPairDialog: Failed to register window class" << std::endl;
+    UniversalBleLogger::LogError("PinPairDialog: failed to register window class");
     return L"";
   }
 
@@ -75,7 +77,7 @@ hstring askForPairingPin() {
                            mainWindow.height, NULL, 0, hInstance, NULL);
 
   if (hwnd == NULL) {
-    std::cout << "PinPairDialog: Failed to create window" << std::endl;
+    UniversalBleLogger::LogError("PinPairDialog: failed to create window");
     return L"";
   }
 

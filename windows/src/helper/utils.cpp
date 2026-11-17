@@ -134,21 +134,21 @@ bool is_little_endian() {
 bool is_windows11_or_greater() {
   const HMODULE h_mod = GetModuleHandleW(L"ntdll.dll");
   if (!h_mod) {
-    std::cout << "Failed to get ntdll" << std::endl;
+    UniversalBleLogger::LogError("is_windows11_or_greater: no ntdll");
     return false;
   }
 
   const auto fx_ptr = reinterpret_cast<RtlGetVersionPtr>(
       GetProcAddress(h_mod, "RtlGetVersion"));
   if (fx_ptr == nullptr) {
-    std::cout << "Failed to get RtlGetVersionPtr" << std::endl;
+    UniversalBleLogger::LogError("is_windows11_or_greater: no RtlGetVersion");
     return false;
   }
 
   RTL_OSVERSIONINFOW rove = {0};
   rove.dwOSVersionInfoSize = sizeof(rove);
   if (STATUS_SUCCESS != fx_ptr(&rove)) {
-    std::cout << "Failed to get RTL_OSVERSIONINFOW" << std::endl;
+    UniversalBleLogger::LogError("is_windows11_or_greater: RtlGetVersion failed");
     return false;
   }
 
