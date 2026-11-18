@@ -1269,14 +1269,16 @@ void UniversalBlePlugin::PushUniversalScanResult(
   }
 }
 
-// Scan results report whether a device is paired, and a device that does not
-// advertise a name gets the one Windows knows for it. An advertisement has
-// neither, so the LE devices Windows knows are listed once per scan and
-// matched by address: the paired ones first, which is quick, then the
-// unpaired ones. This replaces a DeviceWatcher that ran alongside the
+// Scan results report whether a device is paired, and a paired device that
+// does not advertise a name gets the one Windows knows for it. An
+// advertisement has neither, so the paired LE devices are listed once per scan
+// and matched by address. This replaces a DeviceWatcher that ran alongside the
 // advertisement watcher and was torn down from its own callback thread.
 //
-// Each list is published whole for the scan it was made for, and results
+// Unpaired devices are not listed: Windows can only enumerate them with a
+// Bluetooth inquiry that runs for 30 seconds, and pairing during it fails.
+//
+// The list is published whole for the scan it was made for, and results
 // already reported are updated with it. A list made for an earlier scan is
 // dropped.
 fire_and_forget UniversalBlePlugin::LoadKnownDevicesAsync(
@@ -1285,29 +1287,25 @@ fire_and_forget UniversalBlePlugin::LoadKnownDevicesAsync(
   if (!plugin.Acquire())
     co_return;
   try {
+    plugin.Release();
+    const auto devices = co_await DeviceInformation::FindAllAsync(
+        BluetoothLEDevice::GetDeviceSelectorFromPairingState(true),
+        {device_address_key});
+    if (!plugin.Acquire())
+      co_return;
     std::unordered_map<std::string, KnownDevice> known;
-    for (const bool paired : {true, false}) {
-      plugin.Release();
-      const auto devices = co_await DeviceInformation::FindAllAsync(
-          BluetoothLEDevice::GetDeviceSelectorFromPairingState(paired),
-          {device_address_key});
-      if (!plugin.Acquire())
-        co_return;
-      for (auto &&device_info : devices) {
-        const auto properties = device_info.Properties();
-        if (!properties.HasKey(device_address_key))
-          continue;
-        const auto address =
-            lookup_i_property_value(properties, device_address_key,
-                                    "DeviceAddress", "LoadKnownDevices");
-        if (address) {
-          known.try_emplace(to_lower_case(to_string(address.GetString())),
-                            KnownDevice{paired, to_string(device_info.Name())});
-        }
+    for (auto &&device_info : devices) {
+      const auto properties = device_info.Properties();
+      if (!properties.HasKey(device_address_key))
+        continue;
+      const auto address = lookup_i_property_value(
+          properties, device_address_key, "DeviceAddress", "LoadKnownDevices");
+      if (address) {
+        known.try_emplace(to_lower_case(to_string(address.GetString())),
+                          KnownDevice{true, to_string(device_info.Name())});
       }
-      if (!PublishKnownDevices(scan_generation, known))
-        co_return;
     }
+    PublishKnownDevices(scan_generation, known);
   } catch (...) {
     // Best effort: without the list, scan results leave pairing state unset.
     LogCurrentException("LoadKnownDevices");
@@ -1321,8 +1319,7 @@ uint64_t UniversalBlePlugin::ResetKnownDevices() {
   return ++scan_generation_;
 }
 
-// Called with the paired list, then with the full one. Once the paired list
-// is in, a device missing from it is known to be unpaired.
+// Once the list is in, a device missing from it is known to be unpaired.
 bool UniversalBlePlugin::PublishKnownDevices(
     const uint64_t scan_generation,
     const std::unordered_map<std::string, KnownDevice> &known) {
