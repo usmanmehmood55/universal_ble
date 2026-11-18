@@ -1511,6 +1511,16 @@ fire_and_forget UniversalBlePlugin::ConnectAsync(uint64_t bluetooth_address,
   };
   std::optional<std::string> failure;
   try {
+    // Every WinRT object of the connection is created on the thread pool, not
+    // on the platform thread. C++/WinRT resumes on the calling thread, so the
+    // device and its services would otherwise belong to the platform thread,
+    // and the Bluetooth service calls back into it. A Close() of an earlier
+    // connection's service that is waiting on that same service then
+    // deadlocks the platform thread (HIL FIT-CONN-009).
+    plugin.Release();
+    co_await winrt::resume_background();
+    if (!plugin.Acquire())
+      co_return;
     // Old services can deny replacement discovery until Close finishes. Yield
     // rather than block Flutter's UI thread, and abandon superseded attempts.
     // A Close that never returns must not hold the attempt until the Dart-side
@@ -2357,6 +2367,14 @@ fire_and_forget UniversalBlePlugin::DiscoverServicesAsync(
 
     const auto gatt_map_lease = device_agent->SnapshotGattMapForOperation();
     const auto &gatt_map = gatt_map_lease.map;
+    if (with_descriptors) {
+      // Descriptor queries run on the thread pool, like the rest of the
+      // connection's WinRT work (see ConnectAsync).
+      plugin.Release();
+      co_await winrt::resume_background();
+      if (!plugin.Acquire())
+        co_return;
+    }
     auto universal_services = flutter::EncodableList();
     for (const auto &[service_id, service] : gatt_map) {
       flutter::EncodableList universal_characteristics;
@@ -2367,8 +2385,6 @@ fire_and_forget UniversalBlePlugin::DiscoverServicesAsync(
         auto descriptors = flutter::EncodableList();
         if (with_descriptors) {
           try {
-            // Awaited on the platform thread, like connect, so the reply below
-            // is sent from the thread Flutter delivered the call on.
             plugin.Release();
             auto descriptor_result =
                 co_await c.GetDescriptorsAsync(BluetoothCacheMode::Cached);
