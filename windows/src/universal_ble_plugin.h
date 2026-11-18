@@ -24,11 +24,12 @@
 #include "ui_thread_handler.hpp"
 #include "universal_ble_thread_safe.h"
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <utility>
-#include <unordered_set>
+#include <unordered_map>
 #include <vector>
 
 namespace universal_ble {
@@ -46,6 +47,13 @@ struct GattServiceObject {
 struct GattDiscovery {
   std::unordered_map<std::string, GattServiceObject> map;
   std::optional<std::string> error;
+  std::function<bool()> proceed;
+};
+
+// A device Windows knows, from the lookup made when a scan starts.
+struct KnownDevice {
+  bool is_paired = false;
+  std::string name;
 };
 
 // Everything one connection owns that has to be closed off the UI thread.
@@ -422,10 +430,13 @@ private:
   std::unordered_map<uint64_t, bool> pending_connects_{};
   uint64_t next_connect_generation_ = 0;
   std::mutex connected_devices_mutex_;
-  // Paired LE devices by lower-case address, with their system name. Written
-  // on the platform thread, read by the advertisement callback.
-  ThreadSafeMap<std::string, std::string> paired_devices_{};
-  std::atomic<bool> paired_devices_loaded_{false};
+  // LE devices Windows knows, by lower-case address, for the scan with
+  // `scan_generation_`. Written by the lookup, read by the advertisement
+  // callback.
+  std::mutex known_devices_mutex_;
+  std::unordered_map<std::string, KnownDevice> known_devices_{};
+  bool pairing_state_known_ = false;
+  uint64_t scan_generation_ = 0;
   ThreadSafeMap<std::string, UniversalBleScanResult> scan_results_{};
   // Addresses Windows has already handed over as a *connectable* packet. A scan
   // response arrives as its own, non-connectable event; this map tracks which
@@ -484,7 +495,12 @@ private:
       const DevicePairingRequestedEventArgs &event_args);
 
   void RadioStateChanged(const Radio &sender, const IInspectable &);
-  fire_and_forget LoadPairedDevicesAsync();
+  fire_and_forget LoadKnownDevicesAsync(uint64_t scan_generation);
+  uint64_t ResetKnownDevices();
+  bool PublishKnownDevices(
+      uint64_t scan_generation,
+      const std::unordered_map<std::string, KnownDevice> &known);
+  bool ApplyKnownDeviceLocked(UniversalBleScanResult &scan_result) const;
   void DisposeAdvertisementWatcher() noexcept;
   fire_and_forget LoadPeripheralSupportAsync();
   void PushUniversalScanResult(UniversalBleScanResult scan_result,

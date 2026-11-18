@@ -44,7 +44,7 @@ int main() {
     CHECK(plan.services);
     CHECK(!plan.name);
     CHECK(ShouldUpdateScanResult(plan, /*is_scan_response=*/true,
-                                 /*connectable_changed=*/false));
+                                 /*changed=*/false));
   }
 
   // A sparse scan response must not evict cached serviceData either.
@@ -54,7 +54,7 @@ int main() {
                          ScanFieldPresence{.service_data = true});
     CHECK(plan.service_data);
     CHECK(ShouldUpdateScanResult(plan, /*is_scan_response=*/true,
-                                 /*connectable_changed=*/false));
+                                 /*changed=*/false));
   }
 
   // is_paired and manufacturer_data are backfilled by the same rule.
@@ -99,16 +99,16 @@ int main() {
 
   // A scan response is an update on its own, even with nothing to backfill.
   CHECK(ShouldUpdateScanResult(ScanBackfillPlan{}, /*is_scan_response=*/true,
-                               /*connectable_changed=*/false));
+                               /*changed=*/false));
 
   // A plain packet with nothing new and an unchanged connectable state is
   // deduplicated.
   CHECK(!ShouldUpdateScanResult(ScanBackfillPlan{}, /*is_scan_response=*/false,
-                                /*connectable_changed=*/false));
+                                /*changed=*/false));
 
   // A connectable-state change is an update on its own.
   CHECK(ShouldUpdateScanResult(ScanBackfillPlan{}, /*is_scan_response=*/false,
-                               /*connectable_changed=*/true));
+                               /*changed=*/true));
 
   // Connectability derivation:
   // Connectable advertisements report connectable.

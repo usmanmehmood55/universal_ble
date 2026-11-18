@@ -480,7 +480,7 @@ std::optional<FlutterError> UniversalBlePlugin::StartScan(
   try {
     scan_results_.clear();
     connectable_heard_.clear();
-    LoadPairedDevicesAsync();
+    LoadKnownDevicesAsync(ResetKnownDevices());
 
     // Setup LeWatcher and apply filters
     if (!bluetooth_le_watcher_) {
@@ -558,6 +558,7 @@ std::optional<FlutterError> UniversalBlePlugin::StartScan(
 
 std::optional<FlutterError> UniversalBlePlugin::StopScan() {
   DisposeAdvertisementWatcher();
+  ResetKnownDevices();
   scan_results_.clear();
   connectable_heard_.clear();
   return std::nullopt;
@@ -1229,16 +1230,27 @@ void UniversalBlePlugin::PushUniversalScanResult(
     // connectability state changes must reach the caller, even when the packet
     // carries nothing else new. Comparing the optional values makes "unknown"
     // a state of its own, so a host that stops answering is visible instead of
-    // being read as a change to `false`.
+    // being read as a change to `false`. A new name or pairing state is an
+    // update too: the paired-device list can supply it after the device was
+    // reported.
     const std::optional<bool> current_connectable =
         current_scan_result.connectable() == nullptr
             ? std::nullopt
             : std::optional<bool>(*current_scan_result.connectable());
     const bool connectable_changed =
         current_connectable != device_is_connectable;
+    const bool name_changed =
+        incoming.name && (current_scan_result.name() == nullptr ||
+                          *current_scan_result.name() != *scan_result.name());
+    const bool pairing_changed =
+        incoming.is_paired &&
+        (current_scan_result.is_paired() == nullptr ||
+         *current_scan_result.is_paired() != *scan_result.is_paired());
 
     // if nothing to update then return
-    if (!ShouldUpdateScanResult(plan, is_scan_response, connectable_changed)) {
+    if (!ShouldUpdateScanResult(plan, is_scan_response,
+                                connectable_changed ||
+                                    name_changed || pairing_changed)) {
       return;
     }
   }
@@ -1257,40 +1269,103 @@ void UniversalBlePlugin::PushUniversalScanResult(
   }
 }
 
-// Scan results report whether a device is paired. Windows has no pairing
-// state in an advertisement, so the paired LE devices are listed once per scan
-// and matched by address. This replaces a DeviceWatcher that ran alongside the
+// Scan results report whether a device is paired, and a device that does not
+// advertise a name gets the one Windows knows for it. An advertisement has
+// neither, so the LE devices Windows knows are listed once per scan and
+// matched by address: the paired ones first, which is quick, then the
+// unpaired ones. This replaces a DeviceWatcher that ran alongside the
 // advertisement watcher and was torn down from its own callback thread.
-fire_and_forget UniversalBlePlugin::LoadPairedDevicesAsync() {
+//
+// Each list is published whole for the scan it was made for, and results
+// already reported are updated with it. A list made for an earlier scan is
+// dropped.
+fire_and_forget UniversalBlePlugin::LoadKnownDevicesAsync(
+    const uint64_t scan_generation) {
   ScopedLease plugin(callback_operations_);
   if (!plugin.Acquire())
     co_return;
   try {
-    paired_devices_loaded_ = false;
-    plugin.Release();
-    const auto devices = co_await DeviceInformation::FindAllAsync(
-        BluetoothLEDevice::GetDeviceSelectorFromPairingState(true),
-        {device_address_key});
-    if (!plugin.Acquire())
-      co_return;
-    paired_devices_.clear();
-    for (auto &&device_info : devices) {
-      const auto properties = device_info.Properties();
-      if (!properties.HasKey(device_address_key))
-        continue;
-      const auto address = lookup_i_property_value(
-          properties, device_address_key, "DeviceAddress", "LoadPairedDevices");
-      if (address) {
-        paired_devices_.insert_or_assign(
-            to_lower_case(to_string(address.GetString())),
-            to_string(device_info.Name()));
+    std::unordered_map<std::string, KnownDevice> known;
+    for (const bool paired : {true, false}) {
+      plugin.Release();
+      const auto devices = co_await DeviceInformation::FindAllAsync(
+          BluetoothLEDevice::GetDeviceSelectorFromPairingState(paired),
+          {device_address_key});
+      if (!plugin.Acquire())
+        co_return;
+      for (auto &&device_info : devices) {
+        const auto properties = device_info.Properties();
+        if (!properties.HasKey(device_address_key))
+          continue;
+        const auto address =
+            lookup_i_property_value(properties, device_address_key,
+                                    "DeviceAddress", "LoadKnownDevices");
+        if (address) {
+          known.try_emplace(to_lower_case(to_string(address.GetString())),
+                            KnownDevice{paired, to_string(device_info.Name())});
+        }
       }
+      if (!PublishKnownDevices(scan_generation, known))
+        co_return;
     }
-    paired_devices_loaded_ = true;
   } catch (...) {
     // Best effort: without the list, scan results leave pairing state unset.
-    LogCurrentException("LoadPairedDevices");
+    LogCurrentException("LoadKnownDevices");
   }
+}
+
+uint64_t UniversalBlePlugin::ResetKnownDevices() {
+  std::lock_guard<std::mutex> lock(known_devices_mutex_);
+  known_devices_.clear();
+  pairing_state_known_ = false;
+  return ++scan_generation_;
+}
+
+// Called with the paired list, then with the full one. Once the paired list
+// is in, a device missing from it is known to be unpaired.
+bool UniversalBlePlugin::PublishKnownDevices(
+    const uint64_t scan_generation,
+    const std::unordered_map<std::string, KnownDevice> &known) {
+  // Held while results are updated, so a StopScan cannot slip in between and
+  // a result is not reported after the scan stopped.
+  std::lock_guard<std::mutex> lock(known_devices_mutex_);
+  if (scan_generation != scan_generation_)
+    return false;
+  known_devices_ = known;
+  pairing_state_known_ = true;
+  for (const auto &entry : scan_results_.get_snapshot()) {
+    auto update = entry.second;
+    if (!ApplyKnownDeviceLocked(update))
+      continue;
+    PushUniversalScanResult(update,
+                            update.connectable() != nullptr &&
+                                *update.connectable(),
+                            false);
+  }
+  return true;
+}
+
+// Requires known_devices_mutex_. Sets the pairing state and, when the result
+// has no name, the name Windows knows. Returns whether anything changed.
+bool UniversalBlePlugin::ApplyKnownDeviceLocked(
+    UniversalBleScanResult &scan_result) const {
+  bool changed = false;
+  const auto known = known_devices_.find(scan_result.device_id());
+  if (known != known_devices_.end() || pairing_state_known_) {
+    const bool paired =
+        known != known_devices_.end() && known->second.is_paired;
+    if (scan_result.is_paired() == nullptr ||
+        *scan_result.is_paired() != paired) {
+      scan_result.set_is_paired(paired);
+      changed = true;
+    }
+  }
+  if (known != known_devices_.end() && !known->second.name.empty() &&
+      (scan_result.name() == nullptr || scan_result.name()->empty())) {
+    scan_result.set_name(known->second.name);
+    changed = true;
+  }
+  return changed;
 }
 
 /// Advertisement received from advertisementWatcher
@@ -1361,16 +1436,12 @@ void UniversalBlePlugin::BluetoothLeWatcherReceived(
       universal_scan_result.set_service_data(&service_data_map);
     }
 
-    // Pairing state and a fallback name come from the paired-device list
-    // loaded when the scan started. Until it has loaded, the state is unknown
-    // and is left unset.
-    const auto paired_name = paired_devices_.get(device_id);
-    if (paired_name.has_value()) {
-      universal_scan_result.set_is_paired(true);
-      if (name.empty() && !paired_name.value().empty())
-        universal_scan_result.set_name(paired_name.value());
-    } else if (paired_devices_loaded_.load()) {
-      universal_scan_result.set_is_paired(false);
+    // Pairing state and a fallback name come from the devices Windows knows,
+    // listed when the scan started. Until that list is in, the pairing state
+    // is unknown and is left unset.
+    {
+      std::lock_guard<std::mutex> lock(known_devices_mutex_);
+      ApplyKnownDeviceLocked(universal_scan_result);
     }
 
     // The scan-response flag comes from the advertisement type and not from
@@ -1520,8 +1591,13 @@ fire_and_forget UniversalBlePlugin::ConnectAsync(uint64_t bluetooth_address,
   ClosingConnection partial;
   auto &device = partial.device;
   std::shared_ptr<BluetoothDeviceAgent> device_agent;
+  // The attempt owns the address from its first WinRT call until its objects
+  // are installed or closed: a replacement attempt waits for the reservation
+  // as it waits for any close, so two attempts never use the same device at
+  // once. Every close of `partial` shares it, so it is never released early.
+  AddressCleanupGate::Reservation ownership;
   const auto abandon = [&]() noexcept {
-    CloseConnectionAsync(std::move(partial), nullptr, nullptr);
+    CloseConnectionAsync(std::move(partial), nullptr, std::move(ownership));
   };
   std::optional<std::string> failure;
   try {
@@ -1535,8 +1611,9 @@ fire_and_forget UniversalBlePlugin::ConnectAsync(uint64_t bluetooth_address,
     co_await winrt::resume_background();
     if (!plugin.Acquire())
       co_return;
-    // Old services can deny replacement discovery until Close finishes. Yield
-    // rather than block Flutter's UI thread, and abandon superseded attempts.
+    // Old services can deny replacement discovery until Close finishes, and a
+    // superseded attempt may still be using the device. Yield rather than
+    // block Flutter's UI thread, and abandon superseded attempts.
     // A Close that never returns must not hold the attempt until the Dart-side
     // timeout, so give up after a bounded wait and report the failure.
     constexpr auto kConnectionCleanupWait = std::chrono::seconds(10);
@@ -1548,8 +1625,10 @@ fire_and_forget UniversalBlePlugin::ConnectAsync(uint64_t bluetooth_address,
         if (ConnectGenerationLocked(bluetooth_address) != connect_generation) {
           co_return;
         }
-        if (!cleanup_gate_.IsClosing(bluetooth_address))
+        if (!cleanup_gate_.IsClosing(bluetooth_address)) {
+          ownership = cleanup_gate_.Reserve(bluetooth_address);
           break;
+        }
       }
       if (std::chrono::steady_clock::now() >= cleanup_deadline) {
         NotifyConnectFailureIfCurrent(
@@ -1585,6 +1664,24 @@ fire_and_forget UniversalBlePlugin::ConnectAsync(uint64_t bluetooth_address,
       co_return;
     }
     UniversalBleLogger::LogInfo("ConnectionLog: Device found");
+
+    // Registered before discovery so that a change the peripheral reports
+    // meanwhile is not lost. Until the connection is installed there is no
+    // agent to refresh, so the change is recorded and the refresh runs once
+    // it is.
+    const auto services_changed = std::make_shared<std::atomic<bool>>(false);
+    const auto services_callback_operations = callback_operations_;
+    partial.gatt_services_changed_token = device.GattServicesChanged(
+        [this, services_callback_operations,
+         services_changed](const BluetoothLEDevice &sender,
+                           const IInspectable &args) {
+          const auto callback = services_callback_operations.TryAcquire();
+          if (!callback.has_value()) {
+            return;
+          }
+          services_changed->store(true);
+          BluetoothLeDeviceGattServicesChanged(sender, args);
+        });
 
     if (auto_connect) {
       // MaintainConnection asks Windows to connect whenever the device is in
@@ -1678,13 +1775,28 @@ fire_and_forget UniversalBlePlugin::ConnectAsync(uint64_t bluetooth_address,
 
     UniversalBleLogger::LogInfo("ConnectionLog: Services discovered");
     const auto discovery = std::make_shared<GattDiscovery>();
+    // Checked before each service's query. It runs while this frame waits, so
+    // `plugin` and `this` are valid; the lease is taken only for the check.
+    discovery->proceed = [&]() {
+      if (!plugin.Acquire())
+        return false;
+      const bool current =
+          IsCurrentConnectAttempt(bluetooth_address, connect_generation);
+      plugin.Release();
+      return current;
+    };
     plugin.Release();
     co_await DiscoverCharacteristicsAsync(services_result.Services(),
                                           BluetoothCacheMode::Uncached,
                                           discovery);
+    discovery->proceed = nullptr;
     partial.gatt_map = std::move(discovery->map);
     if (!plugin.Acquire()) {
       abandon();
+      co_return;
+    }
+    if (!IsCurrentConnectAttempt(bluetooth_address, connect_generation)) {
+      DisposePartialConnection(bluetooth_address, std::move(partial));
       co_return;
     }
     if (discovery->error.has_value()) {
@@ -1703,16 +1815,6 @@ fire_and_forget UniversalBlePlugin::ConnectAsync(uint64_t bluetooth_address,
             return;
           BluetoothLeDeviceConnectionStatusChanged(sender, args);
         });
-    const auto services_callback_operations = callback_operations_;
-    partial.gatt_services_changed_token = device.GattServicesChanged(
-        [this, services_callback_operations](const BluetoothLEDevice &sender,
-                                             const IInspectable &args) {
-          const auto callback = services_callback_operations.TryAcquire();
-          if (!callback.has_value()) {
-            return;
-          }
-          BluetoothLeDeviceGattServicesChanged(sender, args);
-        });
     device_agent = std::make_shared<BluetoothDeviceAgent>(
         bluetooth_address, device,
         partial.connection_status_changed_token.value(),
@@ -1726,10 +1828,16 @@ fire_and_forget UniversalBlePlugin::ConnectAsync(uint64_t bluetooth_address,
       DisposeConnection(device_agent);
       co_return;
     }
+    // Installed: whoever removes the agent now reserves the address.
+    ownership.reset();
     DisposeConnection(previous_device_agent);
     if (NotifyConnectedIfCurrent(bluetooth_address, connect_generation,
                                  device)) {
       UniversalBleLogger::LogInfo("ConnectionLog: Connected");
+      if (services_changed->exchange(false) &&
+          device_agent->BeginGattRefresh()) {
+        RefreshGattServicesAsync(bluetooth_address, device_agent);
+      }
     } else if (CleanConnection(bluetooth_address, &device)) {
       NotifyConnectionChanged(
           bluetooth_address, false,
@@ -1765,7 +1873,8 @@ fire_and_forget UniversalBlePlugin::ConnectAsync(uint64_t bluetooth_address,
 
 // Builds the characteristic map for `services`. Any failure ends discovery and
 // is reported in `out->error`; services queried so far stay in `out->map` so
-// the caller can close them.
+// the caller can close them. `out->proceed`, when set, is asked before each
+// service, and discovery stops early when it returns false.
 //
 // AccessDenied has two causes. Windows owns HID over GATT for its own HID
 // driver and always denies apps that service; it is kept with no
@@ -1777,6 +1886,9 @@ IAsyncAction UniversalBlePlugin::DiscoverCharacteristicsAsync(
     IVectorView<GattDeviceService> services, BluetoothCacheMode cache_mode,
     std::shared_ptr<GattDiscovery> out) {
   for (GattDeviceService &&service : services) {
+    if (out->proceed && !out->proceed()) {
+      co_return;
+    }
     GattServiceObject gatt_service;
     gatt_service.obj = service;
     const auto service_uuid = guid_to_uuid(service.Uuid());
@@ -2341,7 +2453,7 @@ void UniversalBlePlugin::ResetState() {
     DisposeAdvertisementWatcher();
     scan_results_.clear();
     connectable_heard_.clear();
-    paired_devices_.clear();
+    ResetKnownDevices();
 
     // Close all connected devices and clear map
     std::vector<std::shared_ptr<BluetoothDeviceAgent>> device_agents;

@@ -1,9 +1,11 @@
 #include <iostream>
 #include <list>
 #include <map>
+#include <optional>
 #include <mutex>
 #include <shared_mutex>
 #include <thread>
+#include <unordered_map>
 
 namespace universal_ble {
 // Thread Safe Map wrapper
@@ -37,7 +39,7 @@ public:
     data.clear();
   }
 
-  std::map<Key, Value> get_snapshot() const {
+  std::unordered_map<Key, Value> get_snapshot() const {
     std::shared_lock lock(mutex);
     return data;
   }
