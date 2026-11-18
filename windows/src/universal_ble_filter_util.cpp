@@ -7,13 +7,8 @@
 
 namespace universal_ble {
 
-// The filter of the current scan, plus the last one it was set from. The matching
-// rules themselves live in scan_filter_matcher.cpp; this file only translates
-// the pigeon/flutter types into the plain ones it works with.
-namespace {
-ScanFilterValues scanFilterValues;
-}  // namespace
-
+// The matching rules live in scan_filter_matcher.cpp; this file only
+// translates the pigeon/flutter types into the plain ones they work with.
 namespace {
 
 std::vector<std::string> ToStringList(const flutter::EncodableList &list) {
@@ -80,22 +75,22 @@ AdvertisementValues ToAdvertisementValues(
 
 }  // namespace
 
-void setScanFilter(const UniversalScanFilter filter) {
-  scanFilterValues = ScanFilterValues();
-  scanFilterValues.services = ToStringList(filter.with_services());
-  scanFilterValues.service_data = ToStringList(filter.with_service_data());
-  scanFilterValues.name_prefix = ToStringList(filter.with_name_prefix());
-  scanFilterValues.manufacturer_data =
+ScanFilterValues ToScanFilter(const UniversalScanFilter &filter) {
+  ScanFilterValues values;
+  values.services = ToStringList(filter.with_services());
+  values.service_data = ToStringList(filter.with_service_data());
+  values.name_prefix = ToStringList(filter.with_name_prefix());
+  values.manufacturer_data =
       ToManufacturerFilters(filter.with_manufacturer_data());
+  return values;
 }
 
-void resetScanFilter() { scanFilterValues = ScanFilterValues(); }
-
-bool filterDevice(UniversalBleScanResult scanResult) {
-  if (!HasAnyFilter(scanFilterValues)) {
+bool filterDevice(const ScanFilterValues &filter,
+                  const UniversalBleScanResult &scanResult) {
+  if (!HasAnyFilter(filter)) {
     return true;
   }
-  return MatchesScanFilter(scanFilterValues, ToAdvertisementValues(scanResult));
+  return MatchesScanFilter(filter, ToAdvertisementValues(scanResult));
 }
 
 }  // namespace universal_ble

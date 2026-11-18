@@ -22,7 +22,8 @@
 #include "helper/universal_enum.h"
 #include "helper/utils.h"
 #include "ui_thread_handler.hpp"
-#include "universal_ble_thread_safe.h"
+#include "scan_filter_matcher.h"
+#include "scan_result_merge.h"
 #include <atomic>
 #include <functional>
 #include <memory>
@@ -430,19 +431,24 @@ private:
   std::unordered_map<uint64_t, bool> pending_connects_{};
   uint64_t next_connect_generation_ = 0;
   std::mutex connected_devices_mutex_;
-  // LE devices Windows knows, by lower-case address, for the scan with
-  // `scan_generation_`. Written by the lookup, read by the advertisement
-  // callback.
-  std::mutex known_devices_mutex_;
+  // State of the current scan, guarded by scan_mutex_. Each start or stop
+  // begins a new generation; packets from a retired watcher, lookups made for
+  // an earlier generation and reports queued before it are dropped.
+  std::mutex scan_mutex_;
+  uint64_t scan_generation_ = 0;
+  BluetoothLEAdvertisementWatcher scan_watcher_{nullptr};
+  ScanFilterValues scan_filter_{};
+  // Paired LE devices by lower-case address, from the lookup for this scan.
   std::unordered_map<std::string, KnownDevice> known_devices_{};
   bool pairing_state_known_ = false;
-  uint64_t scan_generation_ = 0;
-  ThreadSafeMap<std::string, UniversalBleScanResult> scan_results_{};
+  std::unordered_map<std::string, UniversalBleScanResult> scan_results_{};
   // Addresses Windows has already handed over as a *connectable* packet. A scan
   // response arrives as its own, non-connectable event; this map tracks which
   // addresses were heard as connectable so scan responses preserve their
   // connectable state.
-  ThreadSafeMap<std::string, bool> connectable_heard_{};
+  std::unordered_map<std::string, bool> connectable_heard_{};
+  // Where each device is in waiting for its first scan response.
+  std::unordered_map<std::string, ScanResponseWait> scan_response_waits_{};
 
   event_token bluetooth_le_watcher_received_token_;
   event_token bluetooth_le_watcher_stopped_token_;
@@ -496,16 +502,19 @@ private:
 
   void RadioStateChanged(const Radio &sender, const IInspectable &);
   fire_and_forget LoadKnownDevicesAsync(uint64_t scan_generation);
-  uint64_t ResetKnownDevices();
+  uint64_t ResetScanStateLocked();
   bool PublishKnownDevices(
       uint64_t scan_generation,
       const std::unordered_map<std::string, KnownDevice> &known);
   bool ApplyKnownDeviceLocked(UniversalBleScanResult &scan_result) const;
   void DisposeAdvertisementWatcher() noexcept;
   fire_and_forget LoadPeripheralSupportAsync();
-  void PushUniversalScanResult(UniversalBleScanResult scan_result,
-                               std::optional<bool> is_connectable,
-                               bool is_scan_response);
+  void PushScanResultLocked(UniversalBleScanResult scan_result,
+                            std::optional<bool> is_connectable,
+                            bool is_scan_response, bool expects_scan_response);
+  void ReportScanResultLocked(UniversalBleScanResult scan_result);
+  fire_and_forget ReportHeldScanResultAsync(std::string device_id,
+                                            uint64_t scan_generation);
   void BluetoothLeWatcherReceived(
       const BluetoothLEAdvertisementWatcher &sender,
       const BluetoothLEAdvertisementReceivedEventArgs &args);
@@ -534,6 +543,11 @@ private:
   void NotifyConnectFailureIfCurrent(uint64_t bluetooth_address,
                                      uint64_t connect_generation,
                                      const std::string &error_message) noexcept;
+  void FailConnectAttempt(uint64_t bluetooth_address,
+                          uint64_t connect_generation, bool auto_connect,
+                          const std::string &error_message) noexcept;
+  fire_and_forget RetryAutoConnectAsync(uint64_t bluetooth_address,
+                                        uint64_t connect_generation);
   void NotifyConnectionChanged(
       uint64_t bluetooth_address, bool connected,
       std::optional<std::string> error = std::nullopt,
@@ -561,6 +575,12 @@ private:
   static void DisposeGattMap(
       std::unordered_map<std::string, GattServiceObject> gatt_map,
       const std::vector<GattDeviceService> *retained_services = nullptr);
+  static void RemoveValueChangedHandlers(
+      std::unordered_map<std::string, GattServiceObject> &gatt_map);
+  void RetireGattMap(uint64_t bluetooth_address,
+                     std::unordered_map<std::string, GattServiceObject> gatt_map,
+                     const std::vector<GattDeviceService> &retained,
+                     AddressCleanupGate::Reservation reservation);
 
   event_token RegisterGattValueChangedHandler(
       const std::shared_ptr<BluetoothDeviceAgent> &device_agent,

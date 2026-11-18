@@ -1,5 +1,5 @@
 // Unit tests for the pure scan-result merge, update and connectability
-// decisions used by UniversalBlePlugin::PushUniversalScanResult. They cover the
+// decisions used by UniversalBlePlugin::PushScanResultLocked. They cover the
 // Windows scan-response handling: a scan response must reach the caller, a
 // sparse response must not evict cached data, and scan responses preserve
 // connectability.
@@ -9,6 +9,8 @@
 #include <iostream>
 
 using universal_ble::DeriveConnectableState;
+using universal_ble::NextScanResponseWait;
+using universal_ble::ScanResponseWait;
 using universal_ble::PlanScanBackfill;
 using universal_ble::ScanBackfillPlan;
 using universal_ble::ScanFieldPresence;
@@ -158,6 +160,45 @@ int main() {
                                /*is_scan_response=*/false,
                                /*address_heard_connectable=*/true) ==
         std::nullopt);
+
+  // Waiting for the first scan response:
+  // The first scannable advertisement is held and starts the wait.
+  {
+    const auto step = NextScanResponseWait(ScanResponseWait::kNone,
+                                           /*is_scan_response=*/false,
+                                           /*expects_scan_response=*/true);
+    CHECK(step.state == ScanResponseWait::kHeld);
+    CHECK(!step.report);
+    CHECK(step.start_timer);
+  }
+  // Repeats while held stay held, without another wait.
+  {
+    const auto step = NextScanResponseWait(ScanResponseWait::kHeld, false, true);
+    CHECK(step.state == ScanResponseWait::kHeld);
+    CHECK(!step.report);
+    CHECK(!step.start_timer);
+  }
+  // The scan response ends the wait and is reported.
+  {
+    const auto step = NextScanResponseWait(ScanResponseWait::kHeld, true, false);
+    CHECK(step.state == ScanResponseWait::kDone);
+    CHECK(step.report);
+    CHECK(!step.start_timer);
+  }
+  // A scan response with nothing held is reported too.
+  CHECK(NextScanResponseWait(ScanResponseWait::kNone, true, false).report);
+  // An advertisement that gets no scan response is reported at once.
+  {
+    const auto step = NextScanResponseWait(ScanResponseWait::kNone, false, false);
+    CHECK(step.state == ScanResponseWait::kDone);
+    CHECK(step.report);
+  }
+  // Once the wait is over, a device is never held again in that scan.
+  {
+    const auto step = NextScanResponseWait(ScanResponseWait::kDone, false, true);
+    CHECK(step.report);
+    CHECK(!step.start_timer);
+  }
 
   return 0;
 }

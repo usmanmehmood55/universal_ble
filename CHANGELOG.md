@@ -13,9 +13,10 @@
 ## 3.3.0
 * Windows: allow app shutdown to continue when background connection disposal stalls in WinRT (#375).
 * Windows: closing the app no longer waits for a pending connect, pairing, discovery or subscribe to time out in WinRT.
-* Windows: support `autoConnect`. The connection waits until the device is in range and is re-established after the link is lost.
+* Windows: support `autoConnect`. The connection waits until the device is in range and is re-established after the link is lost; a failed attempt is retried until `disconnect` or another `connect`.
 * Windows: `disconnect` from a connected peripheral first tries to clear its notification and indication subscriptions, as Microsoft's GATT client sample does, waiting at most two seconds before closing.
-* Windows: scan results no longer report pairing state from an earlier scan, and results reported before the paired-device list loaded are updated with it.
+* Windows: scan results no longer report pairing state or results from an earlier scan, and results reported before the paired-device list loaded are updated with it.
+* Windows: an unpaired device that does not advertise a name no longer gets the name Windows remembers for it, so it does not match a `withNamePrefix` filter. Listing unpaired devices takes Windows a 30-second Bluetooth inquiry, and pairing fails while it runs.
 * Windows: connect to devices that expose HID over GATT, a service Windows reserves for itself. The service is listed without characteristics.
 * Windows: `unpair` no longer blocks the UI thread.
 * Windows Peripheral: readiness reports `bluetoothOff` and `unsupported`, `addService` reports why a characteristic or descriptor could not be created instead of timing out, and `updateCharacteristic` reports a characteristic UUID that exists in more than one service.

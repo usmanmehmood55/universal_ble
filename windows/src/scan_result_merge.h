@@ -84,6 +84,43 @@ inline std::optional<bool> DeriveConnectableState(
   return is_connectable;
 }
 
+// Where a device is in waiting for its first scan response during one scan.
+enum class ScanResponseWait {
+  kNone,  // not seen yet
+  kHeld,  // first advertisement held back, waiting for the scan response
+  kDone,  // scan response arrived or the wait ran out; report everything
+};
+
+struct ScanResponseStep {
+  ScanResponseWait state;
+  bool report;       // report this packet now
+  bool start_timer;  // start the wait for the scan response
+};
+
+// Only the first advertisement of a device that accepts scan requests is
+// held, and only once per scan: a device whose scan response never comes is
+// reported when the wait runs out and not held again. A scan response ends
+// the wait and is reported, merged with what was held.
+inline ScanResponseStep NextScanResponseWait(ScanResponseWait state,
+                                             bool is_scan_response,
+                                             bool expects_scan_response) {
+  if (is_scan_response) {
+    return {ScanResponseWait::kDone, true, false};
+  }
+  switch (state) {
+  case ScanResponseWait::kNone:
+    if (expects_scan_response) {
+      return {ScanResponseWait::kHeld, false, true};
+    }
+    return {ScanResponseWait::kDone, true, false};
+  case ScanResponseWait::kHeld:
+    return {ScanResponseWait::kHeld, false, false};
+  case ScanResponseWait::kDone:
+  default:
+    return {ScanResponseWait::kDone, true, false};
+  }
+}
+
 }  // namespace universal_ble
 
 #endif  // FLUTTER_PLUGIN_UNIVERSAL_BLE_SCAN_RESULT_MERGE_H_
