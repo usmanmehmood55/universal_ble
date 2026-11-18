@@ -275,6 +275,33 @@ void main() {
       timeout: const Timeout(Duration(minutes: 1)),
       skip: defaultTargetPlatform != TargetPlatform.windows,
     );
+
+    testWidgets(
+      '[WIN-LIFE-010] autoConnect keeps trying after a failed reconnect',
+      (_) async {
+        await UniversalBle.disconnect(peripheral.deviceId);
+        await _waitDisconnected(peripheral);
+        await UniversalBle.connect(peripheral.deviceId,
+            autoConnect: true, timeout: const Duration(seconds: 30));
+
+        // The fixture drops the next connection right after it is made, so
+        // the reconnect after the link loss fails during discovery.
+        await peripheral.armConnectFault(const Duration(milliseconds: 50));
+        await peripheral.requestDisconnect(_dropDelay);
+        await _waitDisconnected(peripheral);
+
+        expect(await _connectsWithin(peripheral, const Duration(seconds: 30)),
+            isTrue,
+            reason: 'reconnected without a new connect()');
+        await peripheral.discover(withDescriptors: false);
+        expect((await peripheral.readTelemetry()).connectFaultsTriggered, 1,
+            reason: 'one reconnect attempt was dropped');
+        expect(utf8.decode(await peripheral.read(HilUuid.read)),
+            'HIL-READ-V1');
+      },
+      timeout: const Timeout(Duration(minutes: 1)),
+      skip: defaultTargetPlatform != TargetPlatform.windows,
+    );
   });
 }
 
