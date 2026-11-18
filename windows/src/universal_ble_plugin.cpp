@@ -620,12 +620,24 @@ std::optional<FlutterError> UniversalBlePlugin::Connect(
   return std::nullopt;
 }
 
-void UniversalBlePlugin::StartConnect(const uint64_t bluetooth_address,
-                                      const bool auto_connect) {
+// A pending attempt with the same auto-connect setting absorbs the request; a
+// different setting replaces it, so a timed-out auto-connect cannot impose its
+// policy on a later plain connect(). With `only_if_generation`, nothing
+// happens unless the address is still at that generation: the auto-connect
+// retry after a link loss uses it so that a disconnect() or connect() made
+// after the loss wins.
+void UniversalBlePlugin::StartConnect(
+    const uint64_t bluetooth_address, const bool auto_connect,
+    const std::optional<uint64_t> only_if_generation) {
   std::shared_ptr<BluetoothDeviceAgent> stale_device;
   std::optional<uint64_t> connect_generation;
   {
     std::lock_guard<std::mutex> lock(connected_devices_mutex_);
+    if (only_if_generation.has_value() &&
+        ConnectGenerationLocked(bluetooth_address) !=
+            only_if_generation.value()) {
+      return;
+    }
     const auto existing = connected_devices_.find(bluetooth_address);
     if (existing != connected_devices_.end()) {
       bool is_connected = false;
@@ -652,11 +664,12 @@ void UniversalBlePlugin::StartConnect(const uint64_t bluetooth_address,
       connected_devices_.erase(existing);
     }
 
-    if (pending_connects_.find(bluetooth_address) == pending_connects_.end()) {
+    const auto pending = pending_connects_.find(bluetooth_address);
+    if (pending == pending_connects_.end() || pending->second != auto_connect) {
       connect_generation = ++next_connect_generation_;
       connect_generations_.insert_or_assign(bluetooth_address,
                                             connect_generation.value());
-      pending_connects_.insert(bluetooth_address);
+      pending_connects_.insert_or_assign(bluetooth_address, auto_connect);
     }
   }
 
@@ -669,10 +682,8 @@ void UniversalBlePlugin::StartConnect(const uint64_t bluetooth_address,
 std::optional<FlutterError> UniversalBlePlugin::Disconnect(
     const std::string &device_id) {
   const auto device_address = str_to_mac_address(device_id);
-  InvalidateConnectAttempt(device_address);
   uint64_t disconnect_generation = 0;
-  DisposeConnection(
-      RemoveConnectedDevice(device_address, nullptr, &disconnect_generation));
+  DisposeConnection(EndConnection(device_address, &disconnect_generation));
   NotifyConnectionChanged(device_address, false, std::nullopt,
                           disconnect_generation);
   return std::nullopt;
@@ -1036,7 +1047,13 @@ fire_and_forget UniversalBlePlugin::PairAsync(
   ScopedLease plugin(callback_operations_);
   if (!plugin.Acquire())
     co_return;
+  // Marked just before a reply goes out, after its value is built, so an
+  // exception anywhere earlier still gets the fallback reply below.
   bool replied = false;
+  const auto reply = [&](ErrorOr<bool> value) {
+    replied = true;
+    safe_reply("Pair", result, std::move(value));
+  };
   try {
     const auto bluetooth_address = str_to_mac_address(device_id);
     plugin.Release();
@@ -1044,23 +1061,21 @@ fire_and_forget UniversalBlePlugin::PairAsync(
         co_await BluetoothLEDevice::FromBluetoothAddressAsync(bluetooth_address);
     if (!plugin.Acquire())
       co_return;
-    replied = true;
     if (device == nullptr) {
-      result(create_flutter_error(UniversalBleErrorCode::kDeviceNotFound,
+      reply(create_flutter_error(UniversalBleErrorCode::kDeviceNotFound,
                                   "Unknown deviceId: " + device_id));
       co_return;
     }
     const auto pairing = device.DeviceInformation().Pairing();
     if (pairing.IsPaired()) {
-      result(true);
+      reply(true);
       co_return;
     }
     if (!pairing.CanPair()) {
-      result(create_flutter_error(UniversalBleErrorCode::kNotPairable,
+      reply(create_flutter_error(UniversalBleErrorCode::kNotPairable,
                                   "Device is not pairable"));
       co_return;
     }
-    replied = false;
 
     UniversalBleLogger::LogInfo("PairLog: Trying to pair");
     DevicePairingResult pair_result{nullptr};
@@ -1085,8 +1100,7 @@ fire_and_forget UniversalBlePlugin::PairAsync(
 
     const auto status = pair_result.Status();
     const bool is_paired = status == DevicePairingResultStatus::Paired;
-    replied = true;
-    result(is_paired);
+    reply(is_paired);
     PostCentralReport(
         [device_id, is_paired, error = device_pairing_result_to_string(status)](
             UniversalBleCallbackChannel *channel) {
@@ -1100,7 +1114,7 @@ fire_and_forget UniversalBlePlugin::PairAsync(
       co_return;
     UniversalBleLogger::LogError("PairLog: pairing failed");
     if (!replied)
-      result(false);
+      reply(false);
   }
 }
 
@@ -1562,6 +1576,14 @@ fire_and_forget UniversalBlePlugin::ConnectAsync(uint64_t bluetooth_address,
           "or was seen in a recent scan");
       co_return;
     }
+    // disconnect() or a newer connect() may have come during the lookup. The
+    // check repeats after every lookup below; a superseded attempt hands its
+    // objects to the usual cleanup, which keeps the address reserved until
+    // they are closed.
+    if (!IsCurrentConnectAttempt(bluetooth_address, connect_generation)) {
+      DisposePartialConnection(bluetooth_address, std::move(partial));
+      co_return;
+    }
     UniversalBleLogger::LogInfo("ConnectionLog: Device found");
 
     if (auto_connect) {
@@ -1574,6 +1596,10 @@ fire_and_forget UniversalBlePlugin::ConnectAsync(uint64_t bluetooth_address,
           co_await GattSession::FromDeviceIdAsync(device.BluetoothDeviceId());
       if (!plugin.Acquire()) {
         abandon();
+        co_return;
+      }
+      if (!IsCurrentConnectAttempt(bluetooth_address, connect_generation)) {
+        DisposePartialConnection(bluetooth_address, std::move(partial));
         co_return;
       }
       partial.session.MaintainConnection(true);
@@ -1592,6 +1618,10 @@ fire_and_forget UniversalBlePlugin::ConnectAsync(uint64_t bluetooth_address,
       }
     }
 
+    if (!IsCurrentConnectAttempt(bluetooth_address, connect_generation)) {
+      DisposePartialConnection(bluetooth_address, std::move(partial));
+      co_return;
+    }
     plugin.Release();
     auto services_result =
         co_await device.GetGattServicesAsync(BluetoothCacheMode::Uncached);
@@ -1615,6 +1645,15 @@ fire_and_forget UniversalBlePlugin::ConnectAsync(uint64_t bluetooth_address,
       plugin.Release();
       co_await winrt::resume_after(
           std::chrono::milliseconds(250 * (retry + 1)));
+      if (!plugin.Acquire()) {
+        abandon();
+        co_return;
+      }
+      if (!IsCurrentConnectAttempt(bluetooth_address, connect_generation)) {
+        DisposePartialConnection(bluetooth_address, std::move(partial));
+        co_return;
+      }
+      plugin.Release();
       services_result =
           co_await device.GetGattServicesAsync(BluetoothCacheMode::Uncached);
       if (!plugin.Acquire()) {
@@ -1957,9 +1996,11 @@ void UniversalBlePlugin::BluetoothLeDeviceConnectionStatusChanged(
                                 disconnect_generation);
         if (reconnect) {
           // Queued behind the disconnect event above, which a newer connect
-          // generation would otherwise suppress.
-          ui_thread_handler_.Post([this, bluetooth_address] {
-            StartConnect(bluetooth_address, true);
+          // generation would otherwise suppress. Skipped if a disconnect() or
+          // connect() came after the loss.
+          ui_thread_handler_.Post([this, bluetooth_address,
+                                   disconnect_generation] {
+            StartConnect(bluetooth_address, true, disconnect_generation);
           });
         }
       } else {
@@ -1997,12 +2038,24 @@ std::shared_ptr<BluetoothDeviceAgent> UniversalBlePlugin::GetConnectedDevice(
   return it == connected_devices_.end() ? nullptr : it->second;
 }
 
-void UniversalBlePlugin::InvalidateConnectAttempt(
-    const uint64_t bluetooth_address) {
+// Ends any attempt and removes any connection for the address in one step.
+// Done separately, a link loss handled in between could remove the device
+// itself and capture the new generation, and its auto-connect retry would
+// then pass the generation check and undo the disconnect.
+std::shared_ptr<BluetoothDeviceAgent> UniversalBlePlugin::EndConnection(
+    const uint64_t bluetooth_address, uint64_t *generation) {
   std::lock_guard<std::mutex> lock(connected_devices_mutex_);
   pending_connects_.erase(bluetooth_address);
-  connect_generations_.insert_or_assign(bluetooth_address,
-                                        ++next_connect_generation_);
+  *generation = ++next_connect_generation_;
+  connect_generations_.insert_or_assign(bluetooth_address, *generation);
+  const auto it = connected_devices_.find(bluetooth_address);
+  if (it == connected_devices_.end()) {
+    return nullptr;
+  }
+  const auto device_agent = it->second;
+  ReserveConnectionCleanupLocked(device_agent);
+  connected_devices_.erase(it);
+  return device_agent;
 }
 
 std::shared_ptr<BluetoothDeviceAgent> UniversalBlePlugin::RemoveConnectedDevice(
@@ -2192,22 +2245,45 @@ fire_and_forget UniversalBlePlugin::CloseConnectionAsync(
                                 BluetoothConnectionStatus::Connected;
     });
     if (connected) {
+      // The writes run together under one budget: a slow or failing link must
+      // not hold the address, and a reconnect waiting for it, for long. The
+      // address stays reserved until the handles below are closed.
+      std::vector<std::pair<std::string,
+                            IAsyncOperation<GattCommunicationStatus>>>
+          writes;
       for (auto &[service_id, service] : closing.gatt_map) {
         for (auto &[char_id, characteristic] : service.characteristics) {
           if (!characteristic.subscription_token.has_value())
             continue;
-          try {
-            co_await characteristic.obj
-                .WriteClientCharacteristicConfigurationDescriptorAsync(
-                    GattClientCharacteristicConfigurationDescriptorValue::
-                        None);
-          } catch (...) {
-            Attempt("CloseConnection", [&] {
-              UniversalBleLogger::LogWarning(
-                  "CloseConnection: could not unsubscribe " + char_id);
-            });
-          }
+          const auto &id = char_id;
+          const auto &obj = characteristic.obj;
+          Attempt("CloseConnection unsubscribe", [&] {
+            writes.emplace_back(
+                id, obj.WriteClientCharacteristicConfigurationDescriptorAsync(
+                        GattClientCharacteristicConfigurationDescriptorValue::
+                            None));
+          });
         }
+      }
+      constexpr auto kUnsubscribeBudget = std::chrono::seconds(2);
+      const auto deadline = std::chrono::steady_clock::now() + kUnsubscribeBudget;
+      for (auto &write : writes) {
+        Attempt("CloseConnection unsubscribe", [&] {
+          const auto remaining = std::chrono::duration_cast<TimeSpan>(
+              deadline - std::chrono::steady_clock::now());
+          if (remaining <= TimeSpan::zero() ||
+              write.second.wait_for(remaining) != AsyncStatus::Completed) {
+            write.second.Cancel();
+            UniversalBleLogger::LogWarning("CloseConnection: unsubscribe of " +
+                                           write.first + " did not complete");
+          } else if (const auto status = write.second.GetResults();
+                     status != GattCommunicationStatus::Success) {
+            UniversalBleLogger::LogWarning(
+                "CloseConnection: unsubscribe of " + write.first +
+                " failed with status " +
+                std::to_string(static_cast<int>(status)));
+          }
+        });
       }
     }
     DisposeGattMap(std::move(closing.gatt_map));

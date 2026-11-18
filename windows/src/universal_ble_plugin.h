@@ -418,7 +418,8 @@ private:
   std::unordered_map<uint64_t, std::shared_ptr<BluetoothDeviceAgent>>
       connected_devices_{};
   std::unordered_map<uint64_t, uint64_t> connect_generations_{};
-  std::unordered_set<uint64_t> pending_connects_{};
+  // Pending attempts by address, with their auto-connect setting.
+  std::unordered_map<uint64_t, bool> pending_connects_{};
   uint64_t next_connect_generation_ = 0;
   std::mutex connected_devices_mutex_;
   // Paired LE devices by lower-case address, with their system name. Written
@@ -446,7 +447,8 @@ private:
       std::function<void(UniversalBleCallbackChannel *)> &&report);
   void PostPeripheralReport(
       std::function<void(UniversalBlePeripheralCallback *)> &&report);
-  void StartConnect(uint64_t bluetooth_address, bool auto_connect);
+  void StartConnect(uint64_t bluetooth_address, bool auto_connect,
+                    std::optional<uint64_t> only_if_generation = std::nullopt);
   // Requires connected_devices_mutex_. 0 when no attempt has been made.
   uint64_t ConnectGenerationLocked(uint64_t bluetooth_address) const;
   bool IsCurrentConnectAttempt(uint64_t bluetooth_address,
@@ -500,7 +502,8 @@ private:
   ConnectedDeviceOrThrow(const std::string &device_id);
   std::shared_ptr<BluetoothDeviceAgent> GetConnectedDevice(
       uint64_t bluetooth_address);
-  void InvalidateConnectAttempt(uint64_t bluetooth_address);
+  std::shared_ptr<BluetoothDeviceAgent>
+  EndConnection(uint64_t bluetooth_address, uint64_t *generation);
   std::shared_ptr<BluetoothDeviceAgent> RemoveConnectedDevice(
       uint64_t bluetooth_address,
       const BluetoothLEDevice *expected_device = nullptr,
