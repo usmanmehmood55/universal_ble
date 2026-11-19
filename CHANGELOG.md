@@ -1,3 +1,14 @@
+## 3.5.0
+* Windows: closing the app no longer waits for a pending connect, pairing, discovery or subscribe to time out in WinRT.
+* Windows: support `autoConnect`. The connection waits until the device is in range and is re-established after the link is lost; a failed attempt is retried until `disconnect` or another `connect`.
+* Windows: `disconnect` from a connected peripheral first tries to clear its notification and indication subscriptions, as Microsoft's GATT client sample does, waiting at most two seconds before closing.
+* Windows: scan results no longer report pairing state or results from an earlier scan, and results reported before the paired-device list loaded are updated with it.
+* Windows: a device's advertisement and scan response are reported as one result, as on Android and Apple. The first advertisement of a device that answers scan requests is held until its scan response arrives, for at most 300 ms, so a name sent in the scan response is there from the first result.
+* Windows: an unpaired device that does not advertise a name no longer gets the name Windows remembers for it, so it does not match a `withNamePrefix` filter. Listing unpaired devices would take Windows a 30-second Bluetooth inquiry on every scan.
+* Windows: connect to devices that expose HID over GATT, a service Windows reserves for itself. The service is listed without characteristics.
+* Windows: `unpair` no longer blocks the UI thread.
+* Windows Peripheral: readiness reports `bluetoothOff` and `unsupported`, `addService` reports why a characteristic or descriptor could not be created instead of timing out, and `updateCharacteristic` reports a characteristic UUID that exists in more than one service.
+
 ## 3.4.0
 * Android: a write or descriptor write that the stack refuses by throwing now fails that call with a classified error and withdraws its pending result, so the next completion is no longer delivered to an orphaned future and every later write stops lagging by one and timing out. The realistic trigger is Android 15+, where `BluetoothGatt.writeCharacteristic(characteristic, value, writeType)` throws `IllegalArgumentException` for an attribute value longer than 512 bytes; a value that long is now rejected before it reaches the stack with `invalidAttributeLength` (#387).
 * Android: report an unknown (`null`) connectability state instead of crashing on the first scan result on Android 7.x and older. `ScanResult.isConnectable()` is API 26+, so reading it unguarded on the plugin's `minSdkVersion 21` threw `NoSuchMethodError` for every result on API 21-25 (#383).
@@ -12,14 +23,6 @@
 
 ## 3.3.0
 * Windows: allow app shutdown to continue when background connection disposal stalls in WinRT (#375).
-* Windows: closing the app no longer waits for a pending connect, pairing, discovery or subscribe to time out in WinRT.
-* Windows: support `autoConnect`. The connection waits until the device is in range and is re-established after the link is lost; a failed attempt is retried until `disconnect` or another `connect`.
-* Windows: `disconnect` from a connected peripheral first tries to clear its notification and indication subscriptions, as Microsoft's GATT client sample does, waiting at most two seconds before closing.
-* Windows: scan results no longer report pairing state or results from an earlier scan, and results reported before the paired-device list loaded are updated with it.
-* Windows: an unpaired device that does not advertise a name no longer gets the name Windows remembers for it, so it does not match a `withNamePrefix` filter. Listing unpaired devices takes Windows a 30-second Bluetooth inquiry, and pairing fails while it runs.
-* Windows: connect to devices that expose HID over GATT, a service Windows reserves for itself. The service is listed without characteristics.
-* Windows: `unpair` no longer blocks the UI thread.
-* Windows Peripheral: readiness reports `bluetoothOff` and `unsupported`, `addService` reports why a characteristic or descriptor could not be created instead of timing out, and `updateCharacteristic` reports a characteristic UUID that exists in more than one service.
 * Apple: complete service discovery when a peripheral's GATT database holds multiple services with the same UUID (#369).
 * iOS: allow turning off central state restoration via `UniversalBleCentralStateRestoration` (Boolean `NO` in `Info.plist`) while keeping the `bluetooth-central` background execution mode. When disabled, `CBCentralManager` is created without a restoration identifier and deferred lazily until first use (#370).
 
