@@ -75,6 +75,42 @@ int main() {
   Expect(Expand({0x0d, 0x18}, AdvertisementSectionType::Flags).empty(),
          "non service-data section is ignored");
 
+  // A whole service-data section: UUID first, payload after it.
+  using universal_ble::ParseServiceData;
+  const auto section16 = ParseServiceData(
+      {0x0d, 0x18, 0x01, 0x02},
+      static_cast<uint8_t>(AdvertisementSectionType::ServiceData16BitUuids));
+  Expect(section16.has_value() &&
+             section16->first == "0000180d-0000-1000-8000-00805f9b34fb" &&
+             section16->second == std::vector<uint8_t>{0x01, 0x02},
+         "16-bit service data splits into UUID and payload");
+  auto air_128_with_payload = air_128;
+  air_128_with_payload.push_back(0xaa);
+  const auto section128 = ParseServiceData(
+      air_128_with_payload,
+      static_cast<uint8_t>(AdvertisementSectionType::ServiceData128BitUuids));
+  Expect(section128.has_value() &&
+             section128->first == "32cdaab2-f83e-4139-a768-637999afd409" &&
+             section128->second == std::vector<uint8_t>{0xaa},
+         "128-bit service data splits into UUID and payload");
+  const auto empty_payload = ParseServiceData(
+      {0x78, 0x56, 0x34, 0x12},
+      static_cast<uint8_t>(AdvertisementSectionType::ServiceData32BitUuids));
+  Expect(empty_payload.has_value() &&
+             empty_payload->first == "12345678-0000-1000-8000-00805f9b34fb" &&
+             empty_payload->second.empty(),
+         "service data without a payload keeps an empty payload");
+  Expect(!ParseServiceData(
+              {0x0d},
+              static_cast<uint8_t>(
+                  AdvertisementSectionType::ServiceData16BitUuids))
+              .has_value(),
+         "service data shorter than its UUID is rejected");
+  Expect(!ParseServiceData({0x0d, 0x18}, static_cast<uint8_t>(
+                                             AdvertisementSectionType::Flags))
+              .has_value(),
+         "non service-data section is not parsed");
+
   if (Failures == 0) {
     std::cout << "All advertisement UUID cases passed\n";
   }

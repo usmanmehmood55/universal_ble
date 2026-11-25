@@ -1,7 +1,9 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace universal_ble {
@@ -22,5 +24,11 @@ namespace universal_ble {
 /// windows/test/advertisement_uuid_test.cpp).
 std::string ExpandServiceUuid(const std::vector<uint8_t> &uuid_bytes,
                               uint8_t uuid_type);
+
+/// Splits a whole service-data section (types `0x16`, `0x20`, `0x21`) into
+/// its expanded UUID and the payload bytes after it. Returns nothing when the
+/// section is shorter than its UUID or `section_type` is not service data.
+std::optional<std::pair<std::string, std::vector<uint8_t>>>
+ParseServiceData(const std::vector<uint8_t> &section, uint8_t section_type);
 
 }  // namespace universal_ble

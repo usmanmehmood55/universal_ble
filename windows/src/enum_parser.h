@@ -6,25 +6,6 @@
 #include "generated/universal_ble.g.h"
 
 namespace universal_ble {
-inline std::string device_watcher_status_to_string(
-    const DeviceWatcherStatus result) {
-  switch (result) {
-    case DeviceWatcherStatus::Created:
-      return "Created";
-    case DeviceWatcherStatus::Aborted:
-      return "Aborted";
-    case DeviceWatcherStatus::EnumerationCompleted:
-      return "EnumerationCompleted";
-    case DeviceWatcherStatus::Started:
-      return "Started";
-    case DeviceWatcherStatus::Stopped:
-      return "Stopped";
-    case DeviceWatcherStatus::Stopping:
-      return "Stopping";
-  }
-  return "";
-}
-
 inline std::optional<std::string> gatt_communication_status_to_error(
     const GattCommunicationStatus result) {
   switch (result) {

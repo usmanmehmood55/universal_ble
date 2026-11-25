@@ -16,45 +16,104 @@
 #include <winrt/base.h>
 
 #include "generated/universal_ble.g.h"
+#include "address_cleanup_gate.h"
 #include "async_operation_tracker.h"
 #include "helper/universal_ble_base.h"
 #include "helper/universal_enum.h"
 #include "helper/utils.h"
 #include "ui_thread_handler.hpp"
-#include "universal_ble_thread_safe.h"
+#include "scan_filter_matcher.h"
+#include "scan_result_merge.h"
+#include "unleased.h"
 #include <atomic>
+#include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <utility>
-#include <unordered_set>
+#include <unordered_map>
 #include <vector>
 
 namespace universal_ble {
-struct GattCharacteristicObject {
-  GattCharacteristic obj = nullptr;
-  std::optional<event_token> subscription_token;
-  bool notification_operation_in_progress = false;
+// What one scan knows about one device.
+struct ScanRecord {
+  // Every packet merged so far, as reported.
+  UniversalBleScanResult result;
+  // Heard in a connectable packet; a scan response does not say.
+  bool heard_connectable = false;
+  ScanResponseWait wait = ScanResponseWait::kNone;
 };
 
-struct GattServiceObject {
-  GattDeviceService obj = nullptr;
-  std::unordered_map<std::string, GattCharacteristicObject> characteristics;
+// A device Windows knows, from the lookup made when a scan starts.
+struct KnownDevice {
+  bool is_paired = false;
+  std::string name;
 };
 
-struct GattSubscriptionSnapshot {
-  uint64_t revision = 0;
-  std::vector<std::pair<std::string, std::string>> characteristics;
+// A notification or indication subscription. Only subscribed characteristics
+// are kept: every other GATT operation looks its characteristic up when it
+// runs.
+struct Subscription {
+  GattCharacteristic characteristic{nullptr};
+  // The ValueChanged handler, once installed.
+  std::optional<event_token> token;
+  // Nonzero while a CCCD write for this characteristic runs; names it.
+  uint64_t operation = 0;
 };
 
-struct GattCharacteristicLease {
-  GattCharacteristicObject characteristic;
-  AsyncOperationTracker::Lease operation;
+// Service and characteristic UUID, as the caller passed them.
+using SubscriptionKey = std::pair<std::string, std::string>;
+
+// The WinRT objects of one connection, closed together off the UI thread.
+struct ConnectionObjects {
+  BluetoothLEDevice device{nullptr};
+  GattSession session{nullptr};
+  std::optional<event_token> status_token;
+  std::optional<event_token> services_token;
+  std::map<SubscriptionKey, Subscription> subscriptions;
 };
 
-struct GattMapLease {
-  std::unordered_map<std::string, GattServiceObject> map;
-  AsyncOperationTracker::Lease operation;
+// One connect() for an address, from the attempt until it is closed. The
+// fields after the constants are guarded by the plugin's connections_mutex_.
+struct Connection {
+  Connection(uint64_t address, uint64_t generation, bool auto_connect)
+      : address(address), generation(generation), auto_connect(auto_connect) {}
+
+  const uint64_t address;
+  const uint64_t generation;
+  const bool auto_connect;
+  // Reported connected. False while the attempt runs, and while the link of
+  // an autoConnect connection is down and Windows re-establishes it
+  // (GattSession.MaintainConnection).
+  bool connected = false;
+  // Set when the record leaves the plugin's map, which it is in exactly
+  // while this is false. Readable without the lock.
+  std::atomic<bool> closed{false};
+  // Set when disconnect() or shutdown removed the record.
+  std::atomic<bool> ended_by_caller{false};
+  ConnectionObjects objects;
+  // Holds the address from the attempt's first WinRT call until the objects
+  // are closed, so a reconnect waits for the close.
+  AddressCleanupGate::Reservation reservation;
+  uint64_t next_operation = 0;
+  // Counts GattServicesChanged events, so a CCCD write that overlapped one
+  // refreshes subscriptions once it is done.
+  uint64_t services_changes = 0;
+};
+
+// The result of one discovery pass. `stale` marks an error from a service
+// object that a Service Changed indication made invalid.
+struct ServiceDiscovery {
+  flutter::EncodableList services;
+  std::optional<FlutterError> error;
+  bool stale = false;
+};
+
+// A connected record with its device, read under the lock.
+struct LiveConnection {
+  std::shared_ptr<Connection> connection;
+  BluetoothLEDevice device{nullptr};
 };
 
 struct PeripheralGattCharacteristicObject {
@@ -68,7 +127,8 @@ struct PeripheralGattCharacteristicObject {
 struct PeripheralGattServiceProviderObject {
   GattServiceProvider obj = nullptr;
   winrt::event_token advertisement_status_changed_token;
-  std::map<std::string, PeripheralGattCharacteristicObject *> characteristics;
+  std::map<std::string, std::unique_ptr<PeripheralGattCharacteristicObject>>
+      characteristics;
 };
 
 enum class PeripheralBlePermission {
@@ -77,271 +137,6 @@ enum class PeripheralBlePermission {
   writeable,
   readEncryptionRequired,
   writeEncryptionRequired,
-};
-
-struct BluetoothDeviceAgent {
-  const uint64_t bluetooth_address;
-  // Assigned under connected_devices_mutex_ before removal, then moved into
-  // the disposal coroutine by the caller that wins Deactivate().
-  AsyncOperationTracker::Lease cleanup_reservation;
-  BluetoothLEDevice device;
-  event_token connection_status_changed_token;
-  event_token gatt_services_changed_token;
-  std::unordered_map<std::string, GattServiceObject> gatt_map;
-  mutable std::mutex gatt_mutex;
-  std::atomic<bool> active{true};
-  bool gatt_refresh_in_progress = false;
-  bool gatt_refresh_requested = false;
-  uint64_t gatt_revision = 0;
-  AsyncOperationTracker gatt_operations;
-
-  BluetoothDeviceAgent(
-      uint64_t bluetooth_address, const BluetoothLEDevice &device,
-      const event_token connection_status_changed_token,
-      const event_token gatt_services_changed_token,
-      std::unordered_map<std::string, GattServiceObject> gatt_map)
-      : bluetooth_address(bluetooth_address),
-        device(device),
-        connection_status_changed_token(connection_status_changed_token),
-        gatt_services_changed_token(gatt_services_changed_token),
-        gatt_map(std::move(gatt_map)) {}
-
-  ~BluetoothDeviceAgent() { device = nullptr; }
-
-  bool Deactivate() noexcept {
-    std::lock_guard<std::mutex> lock(gatt_mutex);
-    const bool was_active = active.exchange(false, std::memory_order_acq_rel);
-    if (was_active) {
-      gatt_operations.Close();
-    }
-    return was_active;
-  }
-
-  bool IsActive() const noexcept {
-    return active.load(std::memory_order_acquire);
-  }
-
-  GattCharacteristicObject FetchCharacteristic(
-      const std::string &service_uuid, const std::string &characteristic_uuid) {
-    std::lock_guard<std::mutex> lock(gatt_mutex);
-    if (!IsActive()) {
-      throw create_flutter_error(UniversalBleErrorCode::kDeviceDisconnected,
-                                 "Device disconnected");
-    }
-    const auto service = gatt_map.find(service_uuid);
-    if (service == gatt_map.end()) {
-      throw create_flutter_error(UniversalBleErrorCode::kServiceNotFound,
-                                 "Service not found");
-    }
-    const auto characteristic =
-        service->second.characteristics.find(characteristic_uuid);
-    if (characteristic == service->second.characteristics.end()) {
-      throw create_flutter_error(UniversalBleErrorCode::kCharacteristicNotFound,
-                                 "Characteristic not found");
-    }
-    return characteristic->second;
-  }
-
-  GattCharacteristicLease FetchCharacteristicForOperation(
-      const std::string &service_uuid, const std::string &characteristic_uuid) {
-    std::lock_guard<std::mutex> lock(gatt_mutex);
-    if (!IsActive()) {
-      throw create_flutter_error(UniversalBleErrorCode::kDeviceDisconnected,
-                                 "Device disconnected");
-    }
-    const auto service = gatt_map.find(service_uuid);
-    if (service == gatt_map.end()) {
-      throw create_flutter_error(UniversalBleErrorCode::kServiceNotFound,
-                                 "Service not found");
-    }
-    const auto characteristic =
-        service->second.characteristics.find(characteristic_uuid);
-    if (characteristic == service->second.characteristics.end()) {
-      throw create_flutter_error(UniversalBleErrorCode::kCharacteristicNotFound,
-                                 "Characteristic not found");
-    }
-    const auto operation = gatt_operations.TryAcquire();
-    if (!operation.has_value()) {
-      throw create_flutter_error(UniversalBleErrorCode::kDeviceDisconnected,
-                                 "Device disconnected");
-    }
-    return {characteristic->second, operation.value()};
-  }
-
-  std::vector<GattDeviceService> SnapshotGattServices() const {
-    std::lock_guard<std::mutex> lock(gatt_mutex);
-    std::vector<GattDeviceService> services;
-    services.reserve(gatt_map.size());
-    for (const auto &[service_id, service] : gatt_map) {
-      (void)service_id;
-      services.push_back(service.obj);
-    }
-    return services;
-  }
-
-  GattMapLease SnapshotGattMapForOperation() {
-    std::lock_guard<std::mutex> lock(gatt_mutex);
-    if (!IsActive()) {
-      throw create_flutter_error(UniversalBleErrorCode::kDeviceDisconnected,
-                                 "Device disconnected");
-    }
-    const auto operation = gatt_operations.TryAcquire();
-    if (!operation.has_value()) {
-      throw create_flutter_error(UniversalBleErrorCode::kDeviceDisconnected,
-                                 "Device disconnected");
-    }
-    return {gatt_map, operation.value()};
-  }
-
-  std::unordered_map<std::string, GattServiceObject> TakeGattMap() {
-    std::lock_guard<std::mutex> lock(gatt_mutex);
-    std::unordered_map<std::string, GattServiceObject> result;
-    result.swap(gatt_map);
-    ++gatt_revision;
-    return result;
-  }
-
-  std::optional<GattSubscriptionSnapshot> SnapshotSubscriptions() const {
-    std::lock_guard<std::mutex> lock(gatt_mutex);
-    if (!IsActive()) {
-      return std::nullopt;
-    }
-    GattSubscriptionSnapshot snapshot;
-    snapshot.revision = gatt_revision;
-    for (const auto &[service_id, service] : gatt_map) {
-      for (const auto &[characteristic_id, characteristic] :
-           service.characteristics) {
-        if (characteristic.notification_operation_in_progress) {
-          return std::nullopt;
-        }
-        if (characteristic.subscription_token.has_value()) {
-          snapshot.characteristics.emplace_back(service_id, characteristic_id);
-        }
-      }
-    }
-    return snapshot;
-  }
-
-  bool ReplaceGattMapIfUnchanged(
-      std::unordered_map<std::string, GattServiceObject> &replacement,
-      const uint64_t expected_revision,
-      std::unordered_map<std::string, GattServiceObject> &previous) {
-    std::lock_guard<std::mutex> lock(gatt_mutex);
-    if (!IsActive() || gatt_revision != expected_revision ||
-        !gatt_operations.IsIdle()) {
-      return false;
-    }
-    for (const auto &[service_id, service] : gatt_map) {
-      (void)service_id;
-      for (const auto &[characteristic_id, characteristic] :
-           service.characteristics) {
-        (void)characteristic_id;
-        if (characteristic.notification_operation_in_progress) {
-          return false;
-        }
-      }
-    }
-    previous.swap(gatt_map);
-    gatt_map.swap(replacement);
-    ++gatt_revision;
-    return true;
-  }
-
-  bool BeginGattRefresh() {
-    std::lock_guard<std::mutex> lock(gatt_mutex);
-    if (!IsActive()) {
-      return false;
-    }
-    if (gatt_refresh_in_progress) {
-      gatt_refresh_requested = true;
-      return false;
-    }
-    gatt_refresh_in_progress = true;
-    return true;
-  }
-
-  bool FinishGattRefresh() {
-    std::lock_guard<std::mutex> lock(gatt_mutex);
-    const bool repeat = gatt_refresh_requested;
-    gatt_refresh_requested = false;
-    gatt_refresh_in_progress = repeat;
-    return repeat;
-  }
-
-  void RequestGattRefresh() {
-    std::lock_guard<std::mutex> lock(gatt_mutex);
-    if (IsActive()) {
-      gatt_refresh_requested = true;
-    }
-  }
-
-  bool BeginNotificationOperation(const std::string &service_uuid,
-                                  const std::string &characteristic_uuid,
-                                  GattCharacteristicObject &characteristic) {
-    std::lock_guard<std::mutex> lock(gatt_mutex);
-    if (!IsActive()) {
-      return false;
-    }
-    const auto service = gatt_map.find(service_uuid);
-    if (service == gatt_map.end()) {
-      return false;
-    }
-    const auto found =
-        service->second.characteristics.find(characteristic_uuid);
-    if (found == service->second.characteristics.end() ||
-        found->second.notification_operation_in_progress) {
-      return false;
-    }
-    found->second.notification_operation_in_progress = true;
-    ++gatt_revision;
-    characteristic = found->second;
-    return true;
-  }
-
-  bool UpdateNotificationOperationToken(
-      const std::string &service_uuid, const std::string &characteristic_uuid,
-      const std::optional<event_token> &subscription_token) {
-    std::lock_guard<std::mutex> lock(gatt_mutex);
-    if (!IsActive()) {
-      return false;
-    }
-    const auto service = gatt_map.find(service_uuid);
-    if (service == gatt_map.end()) {
-      return false;
-    }
-    const auto found =
-        service->second.characteristics.find(characteristic_uuid);
-    if (found == service->second.characteristics.end() ||
-        !found->second.notification_operation_in_progress) {
-      return false;
-    }
-    found->second.subscription_token = subscription_token;
-    ++gatt_revision;
-    return true;
-  }
-
-  bool FinishNotificationOperation(
-      const std::string &service_uuid, const std::string &characteristic_uuid,
-      const std::optional<event_token> &subscription_token) {
-    std::lock_guard<std::mutex> lock(gatt_mutex);
-    if (!IsActive()) {
-      return false;
-    }
-    const auto service = gatt_map.find(service_uuid);
-    if (service == gatt_map.end()) {
-      return false;
-    }
-    const auto found =
-        service->second.characteristics.find(characteristic_uuid);
-    if (found == service->second.characteristics.end() ||
-        !found->second.notification_operation_in_progress) {
-      return false;
-    }
-    found->second.subscription_token = subscription_token;
-    found->second.notification_operation_in_progress = false;
-    ++gatt_revision;
-    return true;
-  }
 };
 
 class UniversalBlePlugin : public flutter::Plugin,
@@ -363,8 +158,8 @@ private:
   static void ErrorCallback(const FlutterError &error) {
     // Ignore ChannelConnection Error, This might occur because of HotReload
     if (error.code() != "channel-error") {
-      std::cout << "ErrorCode: " << error.code()
-                << " Message: " << error.message() << std::endl;
+      UniversalBleLogger::LogError("Callback channel error " + error.code() +
+                                   ": " + error.message());
     }
   }
   static int64_t GetCurrentTimestampMillis() {
@@ -395,38 +190,42 @@ private:
   // running them.
   UniversalBleUiThreadHandler ui_thread_handler_;
   AsyncOperationTracker callback_operations_;
-  AsyncOperationTracker initialization_operations_;
   AsyncOperationTracker cleanup_operations_;
-  // Protected by connected_devices_mutex_; leases outlive map removal.
-  std::unordered_map<uint64_t, AsyncOperationTracker> connection_cleanup_;
+  // Guarded by connections_mutex_.
+  AddressCleanupGate cleanup_gate_;
   Radio bluetooth_radio_{nullptr};
+  // Unset until the default adapter has reported it.
+  std::optional<bool> peripheral_role_supported_;
   RadioState old_radio_state_ = RadioState::Unknown;
   BluetoothLEAdvertisementWatcher bluetooth_le_watcher_{nullptr};
-  DeviceWatcher device_watcher_{nullptr};
 
-  std::unordered_map<uint64_t, std::shared_ptr<BluetoothDeviceAgent>>
-      connected_devices_{};
-  std::unordered_map<uint64_t, uint64_t> connect_generations_{};
-  std::unordered_set<uint64_t> pending_connects_{};
+  // One record per address, and the records' fields: connections_mutex_.
+  std::unordered_map<uint64_t, std::shared_ptr<Connection>> connections_{};
   uint64_t next_connect_generation_ = 0;
-  std::mutex connected_devices_mutex_;
-  ThreadSafeMap<std::string, DeviceInformation> device_watcher_devices_{};
-  ThreadSafeMap<std::string, UniversalBleScanResult> scan_results_{};
-  // Addresses Windows has already handed over as a *connectable* packet. A scan
-  // response arrives as its own, non-connectable event; this map tracks which
-  // addresses were heard as connectable so scan responses preserve their
-  // connectable state.
-  ThreadSafeMap<std::string, bool> connectable_heard_{};
-  // Maps DeviceInformation.Id() -> MAC address string used as key in
-  // device_watcher_devices_
-  ThreadSafeMap<std::string, std::string> device_watcher_id_to_mac_{};
+  std::mutex connections_mutex_;
+  // State of the current scan, guarded by scan_mutex_. Each start or stop
+  // begins a new generation; packets from a retired watcher, lookups made for
+  // an earlier generation and reports queued before it are dropped.
+  std::mutex scan_mutex_;
+  uint64_t scan_generation_ = 0;
+  BluetoothLEAdvertisementWatcher scan_watcher_{nullptr};
+  ScanFilterValues scan_filter_{};
+  // Paired LE devices by lower-case address, from the lookup for this scan.
+  std::unordered_map<std::string, KnownDevice> known_devices_{};
+  // DeviceInformation id to lower-case address, for Removed, which carries
+  // only the id.
+  std::unordered_map<std::string, std::string> paired_ids_{};
+  bool pairing_state_known_ = false;
+  std::unordered_map<std::string, ScanRecord> scan_records_{};
 
+  // Watches the paired devices while a scan runs. Platform thread only.
+  DeviceWatcher paired_watcher_{nullptr};
+  event_token paired_added_token_;
+  event_token paired_updated_token_;
+  event_token paired_removed_token_;
+  event_token paired_completed_token_;
   event_token bluetooth_le_watcher_received_token_;
-  event_token device_watcher_added_token_;
-  event_token device_watcher_updated_token_;
-  event_token device_watcher_removed_token_;
-  event_token device_watcher_enumeration_completed_token_;
-  event_token device_watcher_stopped_token_;
+  event_token bluetooth_le_watcher_stopped_token_;
   event_revoker<IRadio> radio_state_changed_revoker_;
 
   void InitializeAsync();
@@ -439,129 +238,142 @@ private:
       std::function<void(UniversalBleCallbackChannel *)> &&report);
   void PostPeripheralReport(
       std::function<void(UniversalBlePeripheralCallback *)> &&report);
-  fire_and_forget ConnectAsync(uint64_t bluetooth_address,
-                               uint64_t connect_generation);
-  fire_and_forget RefreshGattServicesAsync(
-      uint64_t bluetooth_address,
-      std::shared_ptr<BluetoothDeviceAgent> device_agent);
+  // An event handler that runs `handler` only while the plugin accepts
+  // callbacks, holding the lease while it does.
+  template <typename Handler> auto Guarded(Handler handler) {
+    return [operations = callback_operations_,
+            handler = std::move(handler)](auto &&...args) {
+      const auto lease = operations.TryAcquire();
+      if (lease.has_value()) {
+        handler(std::forward<decltype(args)>(args)...);
+      }
+    };
+  }
+
+  void StartConnect(
+      uint64_t bluetooth_address, bool auto_connect,
+      const std::shared_ptr<Connection> &stale_connection = nullptr);
+  fire_and_forget ConnectAsync(std::shared_ptr<Connection> connection);
+  // What ConfirmLinkAsync confirms: a link that has just come up, or the
+  // link of a connected record that connect() was called for again.
+  enum class LinkCheck { kNewLink, kExistingLink };
+  fire_and_forget ConfirmLinkAsync(std::shared_ptr<Connection> connection,
+                                   LinkCheck check);
+  // Requires connections_mutex_. 0 when the address has no record.
+  uint64_t CurrentGenerationLocked(uint64_t bluetooth_address) const;
+  // Requires connections_mutex_. Removes the record and hands back what has
+  // to be closed.
+  ConnectionObjects TakeLocked(const std::shared_ptr<Connection> &connection,
+                               AddressCleanupGate::Reservation &reservation);
+  // Removes `connection`, if it is still current, closes it and reports the
+  // failure.
+  void FailConnection(const std::shared_ptr<Connection> &connection,
+                      const std::string &error) noexcept;
+  // Posts a connection event, delivered only if the address is still at
+  // `expected_generation` then (0: no record).
+  void NotifyConnectionChanged(uint64_t bluetooth_address, bool connected,
+                               std::optional<std::string> error,
+                               uint64_t expected_generation);
+  void ConnectionStatusChanged(const std::weak_ptr<Connection> &connection,
+                               const BluetoothLEDevice &sender);
+  fire_and_forget RefreshSubscriptionsAsync(
+      std::weak_ptr<Connection> connection);
+  void CloseConnection(uint64_t bluetooth_address, ConnectionObjects objects,
+                       AddressCleanupGate::Reservation reservation);
+  static fire_and_forget CloseConnectionAsync(
+      ConnectionObjects objects, AsyncOperationTracker::Lease cleanup_lease,
+      AddressCleanupGate::Reservation reservation);
+  static void RemoveValueChangedHandlers(
+      std::map<SubscriptionKey, Subscription> &subscriptions);
+  void ResetState();
+  // The connected record for `device_id`. Throws kDeviceNotFound when there
+  // is none.
+  LiveConnection RequireConnected(const std::string &device_id);
+  /// RequireConnected, and also throws kDeviceDisconnected when the link is
+  /// down. The record stays until WinRT reports the drop, so a request
+  /// submitted in between would otherwise be issued and fail with an
+  /// unrelated GATT status. A status read that throws counts as connected:
+  /// the operation itself reports the real error.
+  LiveConnection RequireLive(const std::string &device_id);
+  event_token RegisterValueChangedHandler(
+      const std::shared_ptr<Connection> &connection,
+      const std::string &service_id, const std::string &characteristic_id,
+      const GattCharacteristic &characteristic);
+  void GattCharacteristicValueChanged(
+      const std::weak_ptr<Connection> &connection,
+      const std::string &device_id, const std::string &service_id,
+      const std::string &characteristic_id,
+      const GattValueChangedEventArgs &args);
+
+  fire_and_forget ReadValueAsync(
+      std::string device_id, std::string service, std::string characteristic,
+      std::function<void(ErrorOr<std::vector<uint8_t>> reply)> result);
+  fire_and_forget WriteValueAsync(
+      std::string device_id, std::string service, std::string characteristic,
+      std::vector<uint8_t> value, BleOutputProperty ble_output_property,
+      std::function<void(std::optional<FlutterError> reply)> result);
+  fire_and_forget ReadDescriptorValueAsync(
+      std::string device_id, std::string service, std::string characteristic,
+      std::string descriptor,
+      std::function<void(ErrorOr<std::vector<uint8_t>> reply)> result);
+  fire_and_forget WriteDescriptorValueAsync(
+      std::string device_id, std::string service, std::string characteristic,
+      std::string descriptor, std::vector<uint8_t> value,
+      std::function<void(std::optional<FlutterError> reply)> result);
   fire_and_forget SetNotifiableAsync(
       std::string device_id, std::string service, std::string characteristic,
       BleInputProperty ble_input_property,
       std::function<void(std::optional<FlutterError> reply)> result);
-  fire_and_forget PairAsync(const std::string &device_id,
+  fire_and_forget DiscoverServicesAsync(
+      std::string device_id, bool with_descriptors,
+      std::function<void(ErrorOr<flutter::EncodableList> reply)> result);
+  static IAsyncAction DiscoverServicesOnceAsync(
+      BluetoothLEDevice device, bool with_descriptors,
+      std::shared_ptr<ServiceDiscovery> out);
+  fire_and_forget PairAsync(std::string device_id, bool custom_ceremony,
                             std::function<void(ErrorOr<bool> reply)> result);
-  fire_and_forget CustomPairAsync(
-      const std::string &device_id,
-      std::function<void(ErrorOr<bool> reply)> result);
-  static fire_and_forget GetSystemDevicesAsync(
+  fire_and_forget GetSystemDevicesAsync(
       std::vector<std::string> with_services,
       std::function<void(ErrorOr<flutter::EncodableList> reply)> result);
-  static fire_and_forget IsPairedAsync(
-      const std::string &device_id,
+  fire_and_forget UnPairAsync(
+      std::string device_id,
+      std::function<void(std::optional<FlutterError> reply)> result);
+  fire_and_forget IsPairedAsync(
+      std::string device_id,
       std::function<void(ErrorOr<bool> reply)> result);
-  fire_and_forget DiscoverServicesAsync(
-      const std::string &device_id, bool with_descriptors,
-      std::function<void(ErrorOr<flutter::EncodableList> reply)> result);
 
-  void PairingRequestedHandler(
-      DeviceInformationCustomPairing sender,
+  static void PairingRequestedHandler(
       const DevicePairingRequestedEventArgs &event_args);
 
   void RadioStateChanged(const Radio &sender, const IInspectable &);
-  void SetupDeviceWatcher();
-  void DisposeDeviceWatcher();
-  void PushUniversalScanResult(UniversalBleScanResult scan_result,
-                               std::optional<bool> is_connectable,
-                               bool is_scan_response);
+  fire_and_forget SetRadioStateAsync(
+      RadioState state, std::function<void(ErrorOr<bool> reply)> result);
+  void StartPairedDeviceWatcher(uint64_t scan_generation);
+  void StopPairedDeviceWatcher() noexcept;
+  void PairedDeviceAdded(uint64_t scan_generation,
+                         const DeviceInformation &device);
+  void PairedDeviceRemoved(uint64_t scan_generation, const std::string &id);
+  void PairedDevicesEnumerated(uint64_t scan_generation);
+  void UpdateScanRecordLocked(const std::string &device_id);
+  uint64_t ResetScanStateLocked();
+  bool ApplyKnownDeviceLocked(UniversalBleScanResult &scan_result) const;
+  void DisposeAdvertisementWatcher() noexcept;
+  fire_and_forget LoadPeripheralSupportAsync();
+  void PushScanResultLocked(UniversalBleScanResult scan_result,
+                            std::optional<bool> is_connectable,
+                            bool is_scan_response, bool expects_scan_response);
+  void ReportScanResultLocked(UniversalBleScanResult scan_result);
+  static void MergeScanPacket(UniversalBleScanResult &merged,
+                              const UniversalBleScanResult &packet,
+                              bool is_scan_response);
+  fire_and_forget ReportHeldScanResultAsync(std::string device_id,
+                                            uint64_t scan_generation);
   void BluetoothLeWatcherReceived(
       const BluetoothLEAdvertisementWatcher &sender,
       const BluetoothLEAdvertisementReceivedEventArgs &args);
-  void OnDeviceInfoReceived(const DeviceInformation &device_info);
-  void BluetoothLeDeviceConnectionStatusChanged(const BluetoothLEDevice &sender,
-                                                const IInspectable &args);
-  void BluetoothLeDeviceGattServicesChanged(const BluetoothLEDevice &sender,
-                                            const IInspectable &args);
-  std::shared_ptr<BluetoothDeviceAgent> GetConnectedDevice(
-      uint64_t bluetooth_address);
-  /// Whether [device_agent] still has a live link.
-  ///
-  /// The agent stays registered until WinRT reports the drop, so a request
-  /// submitted in between would otherwise be issued and fail with an unrelated
-  /// GATT status (Unreachable maps to `failed`). A status read that throws
-  /// counts as connected: the operation itself reports the real error.
-  bool HasLiveLink(const std::shared_ptr<BluetoothDeviceAgent> &device_agent);
-  void InvalidateConnectAttempt(uint64_t bluetooth_address);
-  std::shared_ptr<BluetoothDeviceAgent> RemoveConnectedDevice(
-      uint64_t bluetooth_address,
-      const BluetoothLEDevice *expected_device = nullptr,
-      uint64_t *removed_generation = nullptr);
-  bool InstallConnectedDevice(
-      uint64_t bluetooth_address, uint64_t connect_generation,
-      std::shared_ptr<BluetoothDeviceAgent> device_agent,
-      std::shared_ptr<BluetoothDeviceAgent> &previous_device_agent);
-  bool NotifyConnectedIfCurrent(uint64_t bluetooth_address,
-                                uint64_t connect_generation,
-                                const BluetoothLEDevice &expected_device);
-  void NotifyConnectFailureIfCurrent(uint64_t bluetooth_address,
-                                     uint64_t connect_generation,
-                                     const std::string &error_message) noexcept;
-  void NotifyConnectionChanged(
-      uint64_t bluetooth_address, bool connected,
-      std::optional<std::string> error = std::nullopt,
-      std::optional<uint64_t> expected_generation = std::nullopt);
-  void NotifyConnectionException(
-      uint64_t bluetooth_address, const std::string &error_message,
-      const BluetoothLEDevice *expected_device = nullptr);
-  bool CleanConnection(uint64_t bluetooth_address,
-                       const BluetoothLEDevice *expected_device = nullptr,
-                       uint64_t *removed_generation = nullptr);
-  void DisposeConnection(
-      const std::shared_ptr<BluetoothDeviceAgent> &device_agent);
-  // Requires connected_devices_mutex_. Also prunes idle entries of other
-  // addresses.
-  AsyncOperationTracker::Lease
-  ReserveAddressCleanupLocked(uint64_t bluetooth_address);
-  // Requires connected_devices_mutex_. Does not deactivate or close objects.
-  void ReserveConnectionCleanupLocked(
-      const std::shared_ptr<BluetoothDeviceAgent> &device_agent);
-  static fire_and_forget DisposeConnectionAsync(
-      std::shared_ptr<BluetoothDeviceAgent> device_agent,
-      AsyncOperationTracker::Lease cleanup_lease,
-      AsyncOperationTracker::Lease connection_cleanup_lease);
-  // Disposes a connection attempt that never became a BluetoothDeviceAgent.
-  // Like DisposeConnection, closes the WinRT objects off Flutter's UI thread
-  // and holds the address's cleanup reservation until Close returns.
-  void DisposePartialConnection(
-      uint64_t bluetooth_address, BluetoothLEDevice device,
-      std::unordered_map<std::string, GattServiceObject> gatt_map,
-      std::optional<event_token> connection_status_changed_token,
-      std::optional<event_token> gatt_services_changed_token);
-  static fire_and_forget DisposePartialConnectionAsync(
-      BluetoothLEDevice device,
-      std::unordered_map<std::string, GattServiceObject> gatt_map,
-      std::optional<event_token> connection_status_changed_token,
-      std::optional<event_token> gatt_services_changed_token,
-      AsyncOperationTracker::Lease cleanup_lease,
-      AsyncOperationTracker::Lease connection_cleanup_lease);
-  void ResetState();
-  static void DisposeServices(
-      const std::shared_ptr<BluetoothDeviceAgent> &device_agent);
-  static void DisposeGattMap(
-      std::unordered_map<std::string, GattServiceObject> gatt_map,
-      const std::vector<GattDeviceService> *retained_services = nullptr);
-
-  event_token RegisterGattValueChangedHandler(
-      const std::shared_ptr<BluetoothDeviceAgent> &device_agent,
-      const std::string &device_id, const std::string &service_id,
-      const std::string &characteristic_id,
-      const GattCharacteristic &characteristic);
-  void GattCharacteristicValueChanged(
-      const std::weak_ptr<BluetoothDeviceAgent> &device_agent,
-      const std::string &device_id, const std::string &service_id,
-      const std::string &characteristic_id,
-      const GattValueChangedEventArgs &args);
   // Peripheral runtime state
-  std::map<std::string, PeripheralGattServiceProviderObject *>
+  // Guarded by peripheral_mutex_. Pointers into it must not outlive the lock.
+  std::map<std::string, std::unique_ptr<PeripheralGattServiceProviderObject>>
       peripheral_service_provider_map_{};
   /// Lowercased service UUIDs from the last successful `StartAdvertising` call.
   /// Empty means all registered services were selected.
@@ -573,15 +385,15 @@ private:
 
   // Peripheral helpers
   void DisposeAdvertisementPublisher();  // Requires peripheral_mutex_.
-  fire_and_forget PeripheralAddServiceAsync(const PeripheralService &service);
+  fire_and_forget PeripheralAddServiceAsync(PeripheralService service);
   fire_and_forget PeripheralReadRequestedAsync(
-      GattLocalCharacteristic const &local_char,
+      GattLocalCharacteristic local_char,
       GattReadRequestedEventArgs args);
   fire_and_forget PeripheralWriteRequestedAsync(
-      GattLocalCharacteristic const &local_char,
+      GattLocalCharacteristic local_char,
       GattWriteRequestedEventArgs args);
   fire_and_forget PeripheralSubscribedClientsChanged(
-      GattLocalCharacteristic const &local_char, IInspectable const &args);
+      GattLocalCharacteristic local_char, IInspectable args);
   void PeripheralAdvertisementStatusChanged(
       GattServiceProvider const &sender,
       GattServiceProviderAdvertisementStatusChangedEventArgs const &args);

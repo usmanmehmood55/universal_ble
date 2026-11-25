@@ -68,4 +68,30 @@ std::string ExpandServiceUuid(const std::vector<uint8_t> &uuid_bytes,
   }
 }
 
+std::optional<std::pair<std::string, std::vector<uint8_t>>>
+ParseServiceData(const std::vector<uint8_t> &section, uint8_t section_type) {
+  size_t uuid_size = 0;
+  switch (static_cast<AdvertisementSectionType>(section_type)) {
+    case AdvertisementSectionType::ServiceData16BitUuids:
+      uuid_size = 2;
+      break;
+    case AdvertisementSectionType::ServiceData32BitUuids:
+      uuid_size = 4;
+      break;
+    case AdvertisementSectionType::ServiceData128BitUuids:
+      uuid_size = 16;
+      break;
+    default:
+      return std::nullopt;
+  }
+  if (section.size() < uuid_size) {
+    return std::nullopt;
+  }
+  const auto uuid_end = section.begin() + static_cast<ptrdiff_t>(uuid_size);
+  return std::make_pair(
+      ExpandServiceUuid(std::vector<uint8_t>(section.begin(), uuid_end),
+                        section_type),
+      std::vector<uint8_t>(uuid_end, section.end()));
+}
+
 }  // namespace universal_ble

@@ -47,5 +47,27 @@ int main() {
     CHECK(tracker.WaitUntilIdleFor(std::chrono::milliseconds(1)));
   }
 
+  // ScopedLease keeps the owner busy only while held, and refuses to
+  // re-acquire once the owner has closed the tracker, even after the owner
+  // itself is gone.
+  {
+    std::optional<AsyncOperationTracker> owner(std::in_place);
+    universal_ble::ScopedLease lease(*owner);
+    CHECK(!lease.Held());
+    CHECK(lease.Acquire());
+    CHECK(lease.Held());
+    CHECK(!owner->IsIdle());
+    lease.Release();
+    CHECK(!lease.Held());
+    CHECK(owner->IsIdle());
+    CHECK(lease.Acquire());
+    owner->Close();
+    lease.Release();
+    CHECK(owner->WaitUntilIdleFor(std::chrono::milliseconds(1)));
+    owner.reset();
+    CHECK(!lease.Acquire());
+    CHECK(!lease.Held());
+  }
+
   return 0;
 }

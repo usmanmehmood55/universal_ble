@@ -42,56 +42,21 @@ uint64_t str_to_mac_address(const std::string &mac_str) {
   return mac_address_number;
 }
 
+// Throws std::invalid_argument unless `uuid` is a full, dashed UUID.
 guid uuid_to_guid(const std::string &uuid) {
-  std::stringstream helper;
-  for (int i = 0; i < uuid.length(); i++) {
-    if (uuid[i] != '-') {
-      helper << uuid[i];
-    }
-  }
-  std::string clean_uuid = helper.str();
-  winrt::guid guid;
-  uint64_t *data4_ptr = (uint64_t *)guid.Data4;
-
-  guid.Data1 = static_cast<uint32_t>(
-      std::strtoul(clean_uuid.substr(0, 8).c_str(), nullptr, 16));
-  guid.Data2 = static_cast<uint16_t>(
-      std::strtoul(clean_uuid.substr(8, 4).c_str(), nullptr, 16));
-  guid.Data3 = static_cast<uint16_t>(
-      std::strtoul(clean_uuid.substr(12, 4).c_str(), nullptr, 16));
-  *data4_ptr = _byteswap_uint64(
-      std::strtoull(clean_uuid.substr(16, 16).c_str(), nullptr, 16));
-
-  return guid;
+  return guid(std::string_view(uuid));
 }
 
+// Lower-case, dashed, without braces.
 std::string guid_to_uuid(const guid &guid) {
-  std::stringstream helper;
-  for (uint32_t i = 0; i < 4; i++) {
-    helper << std::hex << std::setw(2) << std::setfill('0')
-           << (int)((uint8_t *)&guid.Data1)[3 - i];
-  }
-  helper << '-';
-  for (uint32_t i = 0; i < 2; i++) {
-    helper << std::hex << std::setw(2) << std::setfill('0')
-           << (int)((uint8_t *)&guid.Data2)[1 - i];
-  }
-  helper << '-';
-  for (uint32_t i = 0; i < 2; i++) {
-    helper << std::hex << std::setw(2) << std::setfill('0')
-           << (int)((uint8_t *)&guid.Data3)[1 - i];
-  }
-  helper << '-';
-  for (uint32_t i = 0; i < 2; i++) {
-    helper << std::hex << std::setw(2) << std::setfill('0')
-           << (int)guid.Data4[i];
-  }
-  helper << '-';
-  for (uint32_t i = 0; i < 6; i++) {
-    helper << std::hex << std::setw(2) << std::setfill('0')
-           << (int)guid.Data4[2 + i];
-  }
-  return helper.str();
+  char chars[36 + 1];
+  sprintf_s(
+      chars,
+      "%08x-%04hx-%04hx-%02hhx%02hhx-%02hhx%02hhx%02hhx%02hhx%02hhx%02hhx",
+      guid.Data1, guid.Data2, guid.Data3, guid.Data4[0], guid.Data4[1],
+      guid.Data4[2], guid.Data4[3], guid.Data4[4], guid.Data4[5], guid.Data4[6],
+      guid.Data4[7]);
+  return std::string{chars};
 }
 
 std::vector<uint8_t> to_bytevc(const IBuffer &buffer) {
@@ -114,17 +79,6 @@ std::string to_hexstring(const std::vector<uint8_t> &bytes) {
   return ss.str();
 }
 
-std::string to_uuidstr(const guid guid) {
-  char chars[36 + 1];
-  sprintf_s(
-      chars,
-      "%08x-%04hx-%04hx-%02hhx%02hhx-%02hhx%02hhx%02hhx%02hhx%02hhx%02hhx",
-      guid.Data1, guid.Data2, guid.Data3, guid.Data4[0], guid.Data4[1],
-      guid.Data4[2], guid.Data4[3], guid.Data4[4], guid.Data4[5], guid.Data4[6],
-      guid.Data4[7]);
-  return std::string{chars};
-}
-
 bool is_little_endian() {
   uint16_t number = 0x1;
   char *numPtr = (char *)&number;
@@ -134,21 +88,21 @@ bool is_little_endian() {
 bool is_windows11_or_greater() {
   const HMODULE h_mod = GetModuleHandleW(L"ntdll.dll");
   if (!h_mod) {
-    std::cout << "Failed to get ntdll" << std::endl;
+    UniversalBleLogger::LogError("is_windows11_or_greater: no ntdll");
     return false;
   }
 
   const auto fx_ptr = reinterpret_cast<RtlGetVersionPtr>(
       GetProcAddress(h_mod, "RtlGetVersion"));
   if (fx_ptr == nullptr) {
-    std::cout << "Failed to get RtlGetVersionPtr" << std::endl;
+    UniversalBleLogger::LogError("is_windows11_or_greater: no RtlGetVersion");
     return false;
   }
 
   RTL_OSVERSIONINFOW rove = {0};
   rove.dwOSVersionInfoSize = sizeof(rove);
   if (STATUS_SUCCESS != fx_ptr(&rove)) {
-    std::cout << "Failed to get RTL_OSVERSIONINFOW" << std::endl;
+    UniversalBleLogger::LogError("is_windows11_or_greater: RtlGetVersion failed");
     return false;
   }
 

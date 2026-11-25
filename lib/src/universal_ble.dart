@@ -241,7 +241,8 @@ class UniversalBle {
   ///
   /// [autoConnect] enables automatic reconnection when the device becomes available.
   /// Default value is `false`.
-  /// Ignored on `Windows`, `Linux` and `Web`.
+  /// Ignored on `Linux` and `Web`. On `Windows`, subscriptions do not survive
+  /// a reconnection and have to be set up again.
   ///
   /// Call [disconnect] to prevent auto-reconnect even while a device is disconnected.
   ///

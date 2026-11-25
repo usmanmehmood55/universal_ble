@@ -12,7 +12,6 @@
 #include "../generated/universal_ble.g.h"
 #include "universal_ble_logger.h"
 
-constexpr uint32_t TEN_SECONDS_IN_MSECS = 10000;
 
 namespace universal_ble {
 
@@ -26,7 +25,6 @@ std::vector<uint8_t> to_bytevc(const IBuffer &buffer);
 IBuffer from_bytevc(std::vector<uint8_t> bytes);
 std::string to_hexstring(const std::vector<uint8_t> &bytes);
 
-std::string to_uuidstr(guid guid);
 bool is_little_endian();
 bool is_windows11_or_greater();
 
@@ -70,22 +68,6 @@ inline void log_and_swallow(const char *where, const std::exception &ex) {
 inline void log_and_swallow_unknown(const char *where) {
   UniversalBleLogger::LogError(std::string(where) +
                                ": unknown native exception");
-}
-
-/// To call async functions synchronously
-template <typename AsyncT>
-static auto async_get(AsyncT const &async) {
-  if (async.Status() == AsyncStatus::Started) {
-    wait_for_completed(async, TEN_SECONDS_IN_MSECS);
-  }
-  try {
-    return async.GetResults();
-  } catch (const hresult_error &err) {
-    throw create_flutter_error(UniversalBleErrorCode::kFailed,
-                               to_string(err.message()));
-  } catch (...) {
-    throw create_flutter_unknown_error();
-  }
 }
 
 }  // namespace universal_ble

@@ -13,7 +13,7 @@
 #include <vector>
 
 using universal_ble::AsyncOperationTracker;
-using universal_ble::WaitForCallbacksWithMessagePump;
+using universal_ble::WaitForCallbacksWithoutMessagePump;
 
 namespace {
 constexpr UINT kForeignMessage = WM_APP + 1;
@@ -49,16 +49,17 @@ winrt::Windows::Foundation::IAsyncAction PendingEnumeration(
   WaitForSingleObject(state->release_operation, INFINITE);
 }
 
-// Model the plugin's initialization-only lifetime protocol with a controlled
-// WinRT operation. The real plugin is also exercised by close_repro.py.
+// Model the plugin's initialization lifetime protocol with a controlled WinRT
+// operation. Initialization shares the plugin's callback lease, and teardown
+// drains it without pumping messages. The real plugin is also exercised by close_repro.py.
 class Initializer {
 public:
   Initializer(std::shared_ptr<CompletionState> state) : state_(state) {
-    const auto initialization_operations = initialization_operations_;
+    const auto callback_operations = callback_operations_;
     PendingEnumeration(state).Completed(
-        [this, state, initialization_operations](const auto &operation,
+        [this, state, callback_operations](const auto &operation,
                                                  const auto &) {
-          const auto callback = initialization_operations.TryAcquire();
+          const auto callback = callback_operations.TryAcquire();
           if (!callback.has_value()) {
             ++state->ignored_completions;
             SetEvent(state->callback_entered);
@@ -68,8 +69,8 @@ public:
           WaitForSingleObject(state->release_callback, INFINITE);
           operation.GetResults();
           std::lock_guard<std::mutex> lock(state->mutex);
-          state->ui_work.push_back([this, initialization_operations] {
-            const auto callback = initialization_operations.TryAcquire();
+          state->ui_work.push_back([this, callback_operations] {
+            const auto callback = callback_operations.TryAcquire();
             if (!callback.has_value())
               return;
             ++state_->publications;
@@ -82,17 +83,12 @@ public:
     // model in sync with the production destructor; close_repro.py exercises
     // the actual plugin in a Flutter runner.
     callback_operations_.Close();
-    initialization_operations_.Close();
-    while (!initialization_operations_.WaitUntilIdleFor(
-        std::chrono::milliseconds(10))) {
-    }
-    WaitForCallbacksWithMessagePump(callback_operations_);
+    WaitForCallbacksWithoutMessagePump(callback_operations_);
   }
 
 private:
   std::shared_ptr<CompletionState> state_;
   AsyncOperationTracker callback_operations_;
-  AsyncOperationTracker initialization_operations_;
 };
 
 bool Check(bool condition, const char *expression, int line) {
